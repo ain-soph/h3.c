@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_sparse.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -53,7 +54,13 @@ enum {
     STREAM_OUT,
     STREAM_FC1,
     STREAM_FC2,
-    STREAM_MATRICES
+    STREAM_MATRICES,
+    /* A packed checkpoint streams INT8 matrices plus their row scales. */
+    STREAM_QKV_SCALES = STREAM_MATRICES,
+    STREAM_OUT_SCALES,
+    STREAM_FC1_SCALES,
+    STREAM_FC2_SCALES,
+    STREAM_SOURCES
 };
 
 typedef struct {
@@ -64,7 +71,8 @@ typedef struct {
 } h3_dit_stream_source;
 
 typedef struct {
-    h3_dit_stream_source sources[STREAM_MATRICES];
+    h3_dit_stream_source sources[STREAM_SOURCES];
+    unsigned count;
 } h3_dit_stream_layer;
 
 struct h3_dit {
@@ -87,6 +95,14 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    /* Loaded from a packed checkpoint: INT8 block matrices and AdaLN rows,
+     * no BF16 copies to fall back to. */
+    int packed;
+    /* H3_SPARSE: block-sparse attention plan over the full sequence (NULL =
+     * dense everywhere) and the steps/blocks that stay dense. */
+    h3_gpu_attention_plan *sparse;
+    h3_gpu_attention_plan *sparse_reduced;   /* same rules on the token-reduced sequence */
+    h3_sparse_params sparse_params;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -525,6 +541,32 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     return 1;
 }
 
+/* Packed checkpoints store each block matrix as the INT8 weight and F32 row
+ * scales that quantize_block_* would have produced on this GPU. */
+static int load_block_packed(h3_dit *dit, h3_dit_block *block,
+                             const char *prefix,
+                             char *error, size_t error_size) {
+    char name[160];
+#define LOADQ(field, scales, suffix, rows, columns) do {                        \
+    uint64_t weight_shape[] = {rows, columns};                                  \
+    uint64_t scale_shape[] = {rows};                                            \
+    snprintf(name, sizeof(name), "%s%s.qweight", prefix, suffix);             \
+    block->field = h3_weight_load_i8(dit->weights, dit->gpu, name, 2,          \
+                                     weight_shape, error, error_size);         \
+    if (!block->field) return 0;                                                \
+    snprintf(name, sizeof(name), "%s%s.qscale", prefix, suffix);              \
+    block->scales = h3_weight_load_f32(dit->weights, dit->gpu, name, 1,        \
+                                       scale_shape, error, error_size);        \
+    if (!block->scales) return 0;                                               \
+} while (0)
+    LOADQ(qkv_int8, qkv_scales, "attn.qkv_proj", INNER * 3, HIDDEN);
+    LOADQ(out_int8, out_scales, "attn.out_proj", HIDDEN, INNER);
+    LOADQ(fc1_int8, fc1_scales, "mlp.fc1", FFN * 2, HIDDEN);
+    LOADQ(fc2_int8, fc2_scales, "mlp.fc2", HIDDEN, FFN);
+#undef LOADQ
+    return 1;
+}
+
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
@@ -578,8 +620,9 @@ static int compare_stream_sources(const void *left, const void *right) {
 
 static int prepare_stream_source(h3_dit *dit,
                                  h3_dit_stream_source *source,
-                                 const char *name, uint64_t rows,
-                                 uint64_t columns, unsigned field,
+                                 const char *name, h3_dtype dtype,
+                                 uint64_t rows, uint64_t columns,
+                                 unsigned field,
                                  char *error, size_t error_size) {
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, &header);
@@ -588,16 +631,17 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
-    if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
-        tensor->shape[0] != rows || tensor->shape[1] != columns ||
-        rows > SIZE_MAX / columns) {
+    int ndim = columns ? 2 : 1;
+    if (!header || tensor->dtype != dtype || tensor->ndim != ndim ||
+        tensor->shape[0] != rows || (columns && tensor->shape[1] != columns) ||
+        (columns && rows > SIZE_MAX / columns)) {
         fail(error, error_size, "streaming weight has the wrong schema: %s",
              name);
         return 0;
     }
     source->path = header->path;
     source->file_offset = tensor->file_offset;
-    source->elements = (size_t)(rows * columns);
+    source->elements = (size_t)(columns ? rows * columns : rows);
     source->field = field;
     return 1;
 }
@@ -606,24 +650,69 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
                                 char *error, size_t error_size) {
     char name[160];
     h3_dit_stream_layer *stream = &dit->stream_layers[layer];
-#define SOURCE(index, suffix, rows, columns, field) do {                        \
+#define SOURCE(index, suffix, dtype, rows, columns, field) do {                 \
     snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
-    if (!prepare_stream_source(dit, &stream->sources[index], name,             \
+    if (!prepare_stream_source(dit, &stream->sources[index], name, dtype,      \
                                rows, columns, field, error, error_size))        \
         return 0;                                                               \
 } while (0)
-    SOURCE(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV);
-    SOURCE(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT);
-    SOURCE(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
-    SOURCE(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
+    if (dit->packed) {
+        SOURCE(0, "attn.qkv_proj.qweight", H3_DTYPE_I8, INNER * 3, HIDDEN,
+               STREAM_QKV);
+        SOURCE(1, "attn.out_proj.qweight", H3_DTYPE_I8, HIDDEN, INNER,
+               STREAM_OUT);
+        SOURCE(2, "mlp.fc1.qweight", H3_DTYPE_I8, FFN * 2, HIDDEN,
+               STREAM_FC1);
+        SOURCE(3, "mlp.fc2.qweight", H3_DTYPE_I8, HIDDEN, FFN, STREAM_FC2);
+        SOURCE(4, "attn.qkv_proj.qscale", H3_DTYPE_F32, INNER * 3, 0,
+               STREAM_QKV_SCALES);
+        SOURCE(5, "attn.out_proj.qscale", H3_DTYPE_F32, HIDDEN, 0,
+               STREAM_OUT_SCALES);
+        SOURCE(6, "mlp.fc1.qscale", H3_DTYPE_F32, FFN * 2, 0,
+               STREAM_FC1_SCALES);
+        SOURCE(7, "mlp.fc2.qscale", H3_DTYPE_F32, HIDDEN, 0,
+               STREAM_FC2_SCALES);
+        stream->count = STREAM_SOURCES;
+    } else {
+        SOURCE(0, "attn.qkv_proj.weight", H3_DTYPE_BF16, INNER * 3, HIDDEN,
+               STREAM_QKV);
+        SOURCE(1, "attn.out_proj.weight", H3_DTYPE_BF16, HIDDEN, INNER,
+               STREAM_OUT);
+        SOURCE(2, "mlp.fc1.weight", H3_DTYPE_BF16, FFN * 2, HIDDEN,
+               STREAM_FC1);
+        SOURCE(3, "mlp.fc2.weight", H3_DTYPE_BF16, HIDDEN, FFN, STREAM_FC2);
+        stream->count = STREAM_MATRICES;
+    }
 #undef SOURCE
-    qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
+    qsort(stream->sources, stream->count, sizeof(stream->sources[0]),
           compare_stream_sources);
     return 1;
 }
 
 static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
                                 char *error, size_t error_size) {
+    if (dit->packed) {
+        slot->qkv_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)INNER * 3 * HIDDEN);
+        slot->out_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * FFN);
+        slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+        slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+        slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        if (!slot->qkv_int8 || !slot->out_int8 || !slot->fc1_int8 ||
+            !slot->fc2_int8 || !slot->qkv_scales || !slot->out_scales ||
+            !slot->fc1_scales || !slot->fc2_scales) {
+            fail(error, error_size, "cannot allocate INT8 SSD layer slot: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        return 1;
+    }
     slot->qkv = h3_gpu_tensor_new_bf16(
         dit->gpu, (size_t)INNER * 3 * HIDDEN);
     slot->out = h3_gpu_tensor_new_bf16(
@@ -640,12 +729,16 @@ static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
     return 1;
 }
 
-static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
-                                         unsigned field) {
-    if (field == STREAM_QKV) return slot->qkv;
-    if (field == STREAM_OUT) return slot->out;
-    if (field == STREAM_FC1) return slot->fc1;
-    if (field == STREAM_FC2) return slot->fc2;
+static h3_gpu_tensor *stream_slot_target(const h3_dit *dit,
+                                         h3_dit_block *slot, unsigned field) {
+    if (field == STREAM_QKV) return dit->packed ? slot->qkv_int8 : slot->qkv;
+    if (field == STREAM_OUT) return dit->packed ? slot->out_int8 : slot->out;
+    if (field == STREAM_FC1) return dit->packed ? slot->fc1_int8 : slot->fc1;
+    if (field == STREAM_FC2) return dit->packed ? slot->fc2_int8 : slot->fc2;
+    if (field == STREAM_QKV_SCALES) return slot->qkv_scales;
+    if (field == STREAM_OUT_SCALES) return slot->out_scales;
+    if (field == STREAM_FC1_SCALES) return slot->fc1_scales;
+    if (field == STREAM_FC2_SCALES) return slot->fc2_scales;
     return NULL;
 }
 
@@ -666,19 +759,23 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->ok = 1;
     job->bytes = 0;
     job->error[0] = '\0';
-    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+    for (unsigned index = 0; index < layer->count; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
-        h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
-                target, source->path, source->file_offset, source->elements,
+        h3_gpu_tensor *target = stream_slot_target(job->dit, slot,
+                                                   source->field);
+        if (!target || h3_gpu_tensor_elements(target) != source->elements ||
+            !h3_gpu_tensor_stream_file(
+                target, source->path, source->file_offset,
                 job->error, sizeof(job->error))) {
             if (!job->error[0])
                 snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
+                         "invalid DiT streaming destination");
             job->ok = 0;
             break;
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        job->bytes += (uint64_t)source->elements *
+            (h3_gpu_tensor_dtype(target) == H3_GPU_I8 ? 1u :
+             h3_gpu_tensor_dtype(target) == H3_GPU_F32 ? 4u : 2u);
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -1253,6 +1350,11 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (dit->packed) {
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size) ||
+                !load_block_packed(dit, &dit->blocks[index], prefix,
+                                   error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1556,6 +1658,92 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+/* Sparse plan for the token-reduced sequence: the same segments with the
+ * target video shortened to its reduced rows, each placed at the position of
+ * its first pooled source token. */
+static int build_reduced_sparse_plan(h3_dit *dit, char *error,
+                                     size_t error_size) {
+    h3_layout reduced = dit->layout;
+    reduced.seq_len = dit->reduced_sequence;
+    reduced.positions = malloc(reduced.seq_len * sizeof(*reduced.positions));
+    reduced.segments = malloc(dit->layout.segment_count *
+                              sizeof(*reduced.segments));
+    if (!reduced.positions || !reduced.segments) {
+        free(reduced.positions);
+        free(reduced.segments);
+        fail(error, error_size, "out of memory building a reduced sparse plan");
+        return 0;
+    }
+    memcpy(reduced.segments, dit->layout.segments,
+           dit->layout.segment_count * sizeof(*reduced.segments));
+    for (size_t index = 0; index < reduced.segment_count; index++)
+        if (reduced.segments[index].kind == H3_SEG_VIDEO &&
+            reduced.segments[index].start == dit->video_target_start)
+            reduced.segments[index].stop = dit->reduced_sequence;
+    for (uint32_t row = 0; row < dit->reduced_sequence; row++) {
+        uint32_t first = row, second = row;
+        token_pool_sources(dit, row, &first, &second);
+        reduced.positions[row] = dit->layout.positions[first];
+    }
+    h3_sparse_plan plan;
+    int ok = h3_sparse_plan_build(&reduced, &dit->sparse_params, 64, 32,
+                                  &plan, error, error_size);
+    free(reduced.positions);
+    free(reduced.segments);
+    if (!ok) return 0;
+    dit->sparse_reduced = h3_gpu_attention_plan_create(
+        dit->gpu, plan.rows, plan.perm, plan.inverse, plan.q_blocks,
+        plan.offsets, plan.kept, plan.indices);
+    fprintf(stderr, "h3: reduced sparse attention density %.3f over %u rows\n",
+            h3_sparse_plan_density(&plan), plan.rows);
+    h3_sparse_plan_free(&plan);
+    if (!dit->sparse_reduced)
+        fail(error, error_size, "cannot upload the reduced sparse plan: %s",
+             h3_gpu_error(dit->gpu));
+    return dit->sparse_reduced != NULL;
+}
+
+/* The packed checkpoint has only the INT8 matrices, so every option that would
+ * read a BF16 block matrix is refused instead of failing mid-render. */
+static int check_packed_options(const h3_dit *dit, int use_slower_bf16_mlp,
+                                int use_slower_bf16_qkv,
+                                int use_slower_bf16_attention_output,
+                                char *error, size_t error_size) {
+    static const char *const bf16_env[] = {
+        "H3_DISABLE_FUSED_MLP", "H3_DISABLE_INT8_MLP", "H3_INT8_MLP_STAGE",
+        "H3_DISABLE_INT8_QKV", "H3_DISABLE_INT8_ATTENTION_OUT",
+        "H3_INT8_KEEP_BF16_MLP", "H3_INT8_KEEP_BF16_QKV",
+        "H3_INT8_KEEP_BF16_ATTENTION_OUT", "H3_BENCH_INT8_MLP_AB",
+        "H3_BENCH_INT8_QKV_AB", "H3_BENCH_INT8_ATTENTION_OUT_AB"
+    };
+    if (use_slower_bf16_mlp || use_slower_bf16_qkv ||
+        use_slower_bf16_attention_output) {
+        fail(error, error_size, "the packed INT8 DiT has no BF16 block "
+             "weights for the --use-slower-bf16-* options");
+        return 0;
+    }
+    for (size_t index = 0; index < sizeof(bf16_env) / sizeof(*bf16_env);
+         index++) {
+        if (getenv(bf16_env[index])) {
+            fail(error, error_size, "%s needs BF16 block weights, which the "
+                 "packed INT8 DiT does not have", bf16_env[index]);
+            return 0;
+        }
+    }
+    if (!dit->fused_mlp || !h3_gpu_has_int8_mlp(dit->gpu)) {
+        fail(error, error_size,
+             "the packed INT8 DiT needs the M5 int8 TensorOps kernels");
+        return 0;
+    }
+    if (dit->sequence < 128) {
+        fail(error, error_size, "the packed INT8 DiT needs at least 128 "
+             "tokens (this request has %u); use a larger canvas or longer "
+             "prompt", dit->sequence);
+        return 0;
+    }
+    return 1;
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -1630,6 +1818,36 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
+    if (h3_sparse_params_from_env(&dit->sparse_params)) {
+        if (dit->token_reduction &&
+            !build_reduced_sparse_plan(dit, error, error_size)) goto failed;
+        h3_sparse_plan plan;
+        if (!h3_gpu_has_nax_extras(dit->gpu)) {
+            fail(error, error_size, "H3_SPARSE needs the M5 NAX attention kernels");
+            goto failed;
+        }
+        if (!h3_sparse_plan_build(&dit->layout, &dit->sparse_params, 64, 32,
+                                  &plan, error, error_size)) goto failed;
+        dit->sparse = h3_gpu_attention_plan_create(
+            dit->gpu, plan.rows, plan.perm, plan.inverse, plan.q_blocks,
+            plan.offsets, plan.kept, plan.indices);
+        fprintf(stderr, "h3: sparse attention density %.3f over %u rows "
+                "(dense: first %d evaluations, blocks <%d and >=%d)\n",
+                h3_sparse_plan_density(&plan), plan.rows,
+                dit->sparse_params.dense_steps, dit->sparse_params.dense_head,
+                (int)H3_DIT_BLOCKS - dit->sparse_params.dense_tail);
+        h3_sparse_plan_free(&plan);
+        if (!dit->sparse) {
+            fail(error, error_size, "cannot upload the sparse attention plan: %s",
+                 h3_gpu_error(dit->gpu));
+            goto failed;
+        }
+    }
+    dit->packed = h3_dit_schedule_is_packed(dit->weights);
+    if (dit->packed && !check_packed_options(
+            dit, use_slower_bf16_mlp, use_slower_bf16_qkv,
+            use_slower_bf16_attention_output, error, error_size))
+        goto failed;
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
@@ -1640,6 +1858,8 @@ static h3_dit *load_dit(const char *weight_directory,
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    if (dit->packed)
+        dit->int8_mlp = dit->int8_qkv = dit->int8_attention_out = 1;
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1923,6 +2143,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    if (dit->sparse) {
+        const h3_sparse_params *sp = &dit->sparse_params;
+        int sparse = step >= sp->dense_steps &&
+            (int)index >= sp->dense_head &&
+            (int)index < (int)H3_DIT_BLOCKS - sp->dense_tail;
+        h3_gpu_attention_plan_use(dit->gpu, !sparse ? NULL :
+            dit->token_reduction_active ? dit->sparse_reduced : dit->sparse);
+    }
     if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
@@ -2235,6 +2463,14 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 streamed_weight.out = slot->out;
                 streamed_weight.fc1 = slot->fc1;
                 streamed_weight.fc2 = slot->fc2;
+                streamed_weight.qkv_int8 = slot->qkv_int8;
+                streamed_weight.qkv_scales = slot->qkv_scales;
+                streamed_weight.out_int8 = slot->out_int8;
+                streamed_weight.out_scales = slot->out_scales;
+                streamed_weight.fc1_int8 = slot->fc1_int8;
+                streamed_weight.fc1_scales = slot->fc1_scales;
+                streamed_weight.fc2_int8 = slot->fc2_int8;
+                streamed_weight.fc2_scales = slot->fc2_scales;
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);
@@ -3054,6 +3290,11 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
+    }
+    if (dit->sparse) {
+        h3_gpu_attention_plan_use(dit->gpu, NULL);
+        h3_gpu_attention_plan_free(dit->sparse);
+        h3_gpu_attention_plan_free(dit->sparse_reduced);
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);

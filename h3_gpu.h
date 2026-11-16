@@ -53,6 +53,8 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -65,6 +67,11 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size);
+/* Uncached stream of a whole tensor of any dtype (the packed INT8 SSD path
+ * streams I8 weights and their F32 row scales). */
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset,
+                              char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
@@ -75,6 +82,8 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -494,8 +503,34 @@ int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale);
+/* Block-sparse attention plan for head-major DiT attention (h3_sparse.h):
+ * perm/inverse reorder rows, offsets/indices list the kept 32-row key blocks
+ * of each 64-row query block. While a plan is in use, head-major attention
+ * over exactly `rows` rows runs sparse on the NAX kernels. */
+typedef struct h3_gpu_attention_plan h3_gpu_attention_plan;
+h3_gpu_attention_plan *h3_gpu_attention_plan_create(
+    h3_gpu *gpu, uint32_t rows, const uint32_t *perm,
+    const uint32_t *inverse, uint32_t q_blocks, const uint32_t *offsets,
+    size_t kept, const uint32_t *indices);
+void h3_gpu_attention_plan_free(h3_gpu_attention_plan *plan);
+void h3_gpu_attention_plan_use(h3_gpu *gpu, h3_gpu_attention_plan *plan);
+/* M5 NAX extras (h3_attention.metal) compiled and usable. */
+int h3_gpu_has_nax_extras(const h3_gpu *gpu);
+/* Mixed precision: F32 input rounded to BF16 (into scratch, which holds
+ * whole 128-row tiles of input_dim), BF16 weight [output_dim][input_dim],
+ * F32 accumulation, F32 bias and output. Dimensions are multiples of 128. */
+int h3_gpu_linear_bf16_weight_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *weight,
+                                  const h3_gpu_tensor *bias,
+                                  h3_gpu_tensor *scratch, uint32_t rows,
+                                  uint32_t input_dim, uint32_t output_dim);
+/* Tests and benches: the next SDPA call reads head-major [head,row,dim]
+ * Q/K/V, as after the fused QKV projection. */
+void h3_gpu_declare_head_major_sdpa_inputs(h3_gpu *gpu);
 /* Preserve SDPA's native [head,row,dimension] output for an immediately
- * following layout-aware projection. */
+ * following layout-aware projection. H3_ATTN=nax routes head-major inputs to
+ * the NAX kernel in h3_attention.metal. */
 int h3_gpu_sdpa_bf16_head_major_output(
                      h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,

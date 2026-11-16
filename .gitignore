@@ -28,3 +28,8 @@ h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
 .DS_Store
+
+# Local serving fork tools and benches.
+h3_bench_*
+h3_pack_int8
+h3_sparse_test
