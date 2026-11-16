@@ -97,6 +97,18 @@
 @implementation H3Conv
 @end
 
+/* Block-sparse DiT attention plan (see h3_sparse.h), resident on the GPU. */
+@interface H3AttentionPlan : NSObject
+@property(nonatomic) uint32_t rows;
+@property(nonatomic) uint32_t qBlocks;
+@property(nonatomic, strong) id<MTLBuffer> perm;
+@property(nonatomic, strong) id<MTLBuffer> inverse;
+@property(nonatomic, strong) id<MTLBuffer> offsets;
+@property(nonatomic, strong) id<MTLBuffer> indices;
+@end
+@implementation H3AttentionPlan
+@end
+
 @interface H3GPU : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -117,6 +129,23 @@
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
 @property(nonatomic) BOOL headMajorSDPAInputs;
+/* h3_attention.metal: the NAX DiT attention kernels (optional; M5 only). */
+@property(nonatomic, strong) id<MTLLibrary> attentionLibrary;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *attentionPipelines;
+/* Scratch for H3_ATTN=int8: int8 Q/K, their per-(head,row) scales, K channel means. */
+@property(nonatomic, strong) id<MTLBuffer> attentionQ8;
+@property(nonatomic, strong) id<MTLBuffer> attentionK8;
+@property(nonatomic, strong) id<MTLBuffer> attentionScales;
+@property(nonatomic, strong) id<MTLBuffer> attentionMean;
+@property(nonatomic) size_t attentionScratchElements;
+/* Sparse plan in effect for the next head-major attention calls (nil = dense)
+ * and its reordered BF16 Q/K/V/O scratch. */
+@property(nonatomic, strong) H3AttentionPlan *attentionPlan;
+@property(nonatomic, strong) id<MTLBuffer> attentionQP;
+@property(nonatomic, strong) id<MTLBuffer> attentionKP;
+@property(nonatomic, strong) id<MTLBuffer> attentionVP;
+@property(nonatomic, strong) id<MTLBuffer> attentionOP;
+@property(nonatomic) size_t attentionPermutedElements;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -391,6 +420,26 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                                                          error:&libraryError];
                 gpu.tensorOpsEnabled = NO;
                 gpu.tensorOpsMode = 0;
+            }
+        }
+        if (gpu.library && gpu.tensorOpsEnabled) {
+            NSString *attentionPath = [[path stringByDeletingLastPathComponent]
+                stringByAppendingPathComponent:@"h3_attention.metal"];
+            NSString *attentionSource = [NSString
+                stringWithContentsOfFile:attentionPath
+                                encoding:NSUTF8StringEncoding error:nil];
+            if (attentionSource) {
+                NSError *attentionError = nil;
+                MTLCompileOptions *attentionOptions = [[MTLCompileOptions alloc] init];
+                attentionOptions.mathMode = MTLMathModeSafe;
+                gpu.attentionLibrary = [gpu.device
+                    newLibraryWithSource:attentionSource
+                                 options:attentionOptions
+                                   error:&attentionError];
+                if (!gpu.attentionLibrary && getenv("H3_ATTN"))
+                    fprintf(stderr, "h3: NAX attention compile failed: %s\n",
+                            attentionError.localizedDescription.UTF8String);
+                gpu.attentionPipelines = [NSMutableDictionary dictionary];
             }
         }
         if (!gpu.library) {
@@ -719,24 +768,27 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                    sizeof(float), H3_GPU_F32, "F32");
 }
 
-static int h3_gpu_tensor_read_file_bf16_mode(
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   sizeof(int8_t), H3_GPU_I8, "I8");
+}
+
+static int h3_gpu_tensor_read_file_mode(
                                  h3_gpu_tensor *opaque, const char *path,
-                                 uint64_t file_offset, size_t elements,
+                                 uint64_t file_offset, size_t bytes,
                                  int uncached,
                                  char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!opaque || !path || !*path ||
-        TENSOR(opaque).dtype != H3_GPU_BF16 ||
-        elements != TENSOR(opaque).elements ||
-        elements > SIZE_MAX / sizeof(uint16_t) || file_offset > INT64_MAX) {
+    if (!opaque || !path || !*path || bytes != TENSOR(opaque).bytes ||
+        file_offset > INT64_MAX) {
         if (error && error_size)
-            snprintf(error, error_size, "invalid BF16 file read request");
+            snprintf(error, error_size, "invalid tensor file read request");
         return 0;
     }
-    size_t bytes = elements * sizeof(uint16_t);
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) {
         if (error && error_size)
-            snprintf(error, error_size, "BF16 file read range overflows");
+            snprintf(error, error_size, "tensor file read range overflows");
         return 0;
     }
     int descriptor = open(path, O_RDONLY | O_CLOEXEC);
@@ -761,7 +813,7 @@ static int h3_gpu_tensor_read_file_bf16_mode(
         if (count <= 0) {
             int detail = count < 0 ? errno : 0;
             if (error && error_size) {
-                snprintf(error, error_size, "cannot read BF16 payload from %s: %s",
+                snprintf(error, error_size, "cannot read tensor payload from %s: %s",
                          path, detail ? strerror(detail) :
                                         "unexpected end of file");
             }
@@ -772,6 +824,23 @@ static int h3_gpu_tensor_read_file_bf16_mode(
     }
     close(descriptor);
     return 1;
+}
+
+static int h3_gpu_tensor_read_file_bf16_mode(
+                                 h3_gpu_tensor *opaque, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 int uncached,
+                                 char *error, size_t error_size) {
+    if (!opaque || TENSOR(opaque).dtype != H3_GPU_BF16 ||
+        elements != TENSOR(opaque).elements ||
+        elements > SIZE_MAX / sizeof(uint16_t)) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid BF16 file read request");
+        return 0;
+    }
+    return h3_gpu_tensor_read_file_mode(opaque, path, file_offset,
+                                        elements * sizeof(uint16_t), uncached,
+                                        error, error_size);
 }
 
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
@@ -786,6 +855,19 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                    char *error, size_t error_size) {
     return h3_gpu_tensor_read_file_bf16_mode(
         opaque, path, file_offset, elements, 1, error, error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *opaque, const char *path,
+                              uint64_t file_offset,
+                              char *error, size_t error_size) {
+    if (!opaque) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid tensor file read request");
+        return 0;
+    }
+    return h3_gpu_tensor_read_file_mode(opaque, path, file_offset,
+                                        TENSOR(opaque).bytes, 1,
+                                        error, error_size);
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
@@ -834,6 +916,14 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
         elements > TENSOR(tensor).elements) return 0;
     memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        elements > TENSOR(tensor).elements) return 0;
+    memcpy(values, TENSOR(tensor).buffer.contents, elements);
     return 1;
 }
 
@@ -1635,11 +1725,313 @@ int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                        0);
 }
 
+static int h3_gpu_require_bf16(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                               size_t elements, NSString *label);
+
+typedef struct {
+    int32_t rows;
+    int32_t heads;
+    float scale;
+    int32_t q_blocks;
+    int32_t k_full;
+    int32_t k_rem;
+} h3_attention_args;
+
+static id<MTLComputePipelineState> h3_gpu_attention_pipeline(H3GPU *gpu,
+                                                              NSString *name) {
+    id<MTLComputePipelineState> pipeline = gpu.attentionPipelines[name];
+    if (pipeline || !gpu.attentionLibrary) return pipeline;
+    id<MTLFunction> function = [gpu.attentionLibrary newFunctionWithName:name];
+    NSError *pipelineError = nil;
+    pipeline = function ? [gpu.device newComputePipelineStateWithFunction:function
+                                                                   error:&pipelineError] : nil;
+    if (pipeline) gpu.attentionPipelines[name] = pipeline;
+    else if (getenv("H3_ATTN"))
+        fprintf(stderr, "h3: NAX attention pipeline %s unavailable: %s\n",
+                name.UTF8String, pipelineError.localizedDescription.UTF8String);
+    return pipeline;
+}
+
+h3_gpu_attention_plan *h3_gpu_attention_plan_create(
+    h3_gpu *opaque, uint32_t rows, const uint32_t *perm,
+    const uint32_t *inverse, uint32_t q_blocks, const uint32_t *offsets,
+    size_t kept, const uint32_t *indices) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !rows || !perm || !inverse || !q_blocks || !offsets ||
+        !indices) return NULL;
+    H3AttentionPlan *plan = [[H3AttentionPlan alloc] init];
+    plan.rows = rows;
+    plan.qBlocks = q_blocks;
+    MTLResourceOptions shared = MTLResourceStorageModeShared;
+    plan.perm = [gpu.device newBufferWithBytes:perm length:rows * 4 options:shared];
+    plan.inverse = [gpu.device newBufferWithBytes:inverse length:rows * 4 options:shared];
+    plan.offsets = [gpu.device newBufferWithBytes:offsets
+                                           length:((size_t)q_blocks + 1) * 4
+                                          options:shared];
+    plan.indices = [gpu.device newBufferWithBytes:indices
+                                           length:MAX(kept, (size_t)1) * 4
+                                          options:shared];
+    if (!plan.perm || !plan.inverse || !plan.offsets || !plan.indices) {
+        h3_gpu_set_error(gpu, @"cannot allocate a sparse attention plan");
+        return NULL;
+    }
+    return (__bridge_retained h3_gpu_attention_plan *)plan;
+}
+
+void h3_gpu_attention_plan_free(h3_gpu_attention_plan *plan) {
+    if (plan) (void)(__bridge_transfer H3AttentionPlan *)plan;
+}
+
+void h3_gpu_attention_plan_use(h3_gpu *opaque,
+                               h3_gpu_attention_plan *plan) {
+    H3GPU *gpu = GPU(opaque);
+    if (gpu) gpu.attentionPlan = (__bridge H3AttentionPlan *)plan;
+}
+
+/* Which DiT attention to use for head-major BF16 inputs: "mps" (MPSGraph
+ * SDPA, the default), "nax" (h3_attention.metal, BF16) or "int8" (NAX with
+ * per-row int8 Q/K and mean-smoothed K, BF16 P@V). */
+static const char *h3_attention_mode(void) {
+    const char *mode = getenv("H3_ATTN");
+    return mode && *mode ? mode : "mps";
+}
+
+/* Head-major [head][row][128] BF16 Q/K/V -> head-major BF16 output. Returns -1
+ * when the kernel is unavailable so the caller can fall back. */
+static int h3_gpu_attention_nax(H3GPU *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value, uint32_t sequence,
+                                uint32_t heads, uint32_t head_dim, float scale,
+                                int int8_qk) {
+    if (head_dim != 128) return -1;
+    const char *variant_env = getenv("H3_ATTN_VARIANT");
+    uint32_t BQ = variant_env && !strcmp(variant_env, "b128") ? 128 : 64;
+    uint32_t BK = variant_env && !strcmp(variant_env, "k64") ? 64 : 32;
+    NSUInteger threads = BQ == 128 ? 256 : 128;
+    H3AttentionPlan *plan = gpu.attentionPlan.rows == sequence ?
+        gpu.attentionPlan : nil;
+    NSString *kernel = int8_qk ? @"h3_attention_nax_qk8_q64_k32" :
+                                 @"h3_attention_nax_bf16_q64_k32";
+    if (plan) kernel = [kernel stringByAppendingString:@"_sparse"];
+    id<MTLComputePipelineState> gather_pipeline = plan ?
+        h3_gpu_attention_pipeline(gpu, @"h3_attention_gather_rows") : nil;
+    if (plan && !gather_pipeline) return -1;
+    const char *stage = getenv("H3_ATTN_STAGE");
+    if (stage && *stage) kernel = [kernel stringByAppendingFormat:@"_s%s", stage];
+    const char *variant = getenv("H3_ATTN_VARIANT");
+    if (variant && *variant) kernel = [kernel stringByAppendingFormat:@"_%s", variant];
+    id<MTLComputePipelineState> pipeline = h3_gpu_attention_pipeline(gpu, kernel);
+    id<MTLComputePipelineState> mean_pipeline = int8_qk ?
+        h3_gpu_attention_pipeline(gpu, @"h3_attention_k_mean") : nil;
+    id<MTLComputePipelineState> quantize_pipeline = int8_qk ?
+        h3_gpu_attention_pipeline(gpu, @"h3_attention_quantize_qk") : nil;
+    if (!pipeline || (int8_qk && (!mean_pipeline || !quantize_pipeline)))
+        return -1;
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!h3_gpu_require_bf16(gpu, query, count, @"attention query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"attention key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"attention value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"attention output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    h3_attention_args args = {(int32_t)sequence, (int32_t)heads, scale,
+                              (int32_t)((sequence + BQ - 1) / BQ),
+                              (int32_t)(sequence / BK),
+                              (int32_t)(sequence % BK)};
+    if (int8_qk && gpu.attentionScratchElements < count) {
+        gpu.attentionQ8 = [gpu.device newBufferWithLength:count
+                                                  options:MTLResourceStorageModePrivate];
+        gpu.attentionK8 = [gpu.device newBufferWithLength:count
+                                                  options:MTLResourceStorageModePrivate];
+        gpu.attentionScales = [gpu.device
+            newBufferWithLength:(size_t)sequence * heads * 2 * sizeof(float)
+                        options:MTLResourceStorageModePrivate];
+        gpu.attentionMean = [gpu.device
+            newBufferWithLength:(size_t)heads * 128 * sizeof(float)
+                        options:MTLResourceStorageModePrivate];
+        if (!gpu.attentionQ8 || !gpu.attentionK8 || !gpu.attentionScales ||
+            !gpu.attentionMean) {
+            gpu.attentionScratchElements = 0;
+            h3_gpu_set_error(gpu, @"cannot allocate int8 attention scratch");
+            return 0;
+        }
+        gpu.attentionScratchElements = count;
+    }
+    if (plan && gpu.attentionPermutedElements < count) {
+        gpu.attentionQP = [gpu.device newBufferWithLength:count * 2
+                                                  options:MTLResourceStorageModePrivate];
+        gpu.attentionKP = [gpu.device newBufferWithLength:count * 2
+                                                  options:MTLResourceStorageModePrivate];
+        gpu.attentionVP = [gpu.device newBufferWithLength:count * 2
+                                                  options:MTLResourceStorageModePrivate];
+        gpu.attentionOP = [gpu.device newBufferWithLength:count * 2
+                                                  options:MTLResourceStorageModePrivate];
+        if (!gpu.attentionQP || !gpu.attentionKP || !gpu.attentionVP ||
+            !gpu.attentionOP) {
+            gpu.attentionPermutedElements = 0;
+            h3_gpu_set_error(gpu, @"cannot allocate sparse attention scratch");
+            return 0;
+        }
+        gpu.attentionPermutedElements = count;
+    }
+    size_t k_scale_offset = (size_t)sequence * heads * sizeof(float);
+    void (^gather)(id<MTLComputeCommandEncoder>, id<MTLBuffer>, id<MTLBuffer>,
+                   id<MTLBuffer>) =
+        ^(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> source,
+          id<MTLBuffer> destination, id<MTLBuffer> rows) {
+            [encoder setComputePipelineState:gather_pipeline];
+            [encoder setBuffer:source offset:0 atIndex:0];
+            [encoder setBuffer:destination offset:0 atIndex:1];
+            [encoder setBuffer:rows offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake((NSUInteger)sequence * 16, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        if (int8_qk) {
+            int32_t no = 0, yes = 1;
+            [encoder setComputePipelineState:mean_pipeline];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
+            [encoder setBuffer:gpu.attentionMean offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake((NSUInteger)heads * 128, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:quantize_pipeline];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+            [encoder setBuffer:gpu.attentionQ8 offset:0 atIndex:1];
+            [encoder setBuffer:gpu.attentionScales offset:0 atIndex:2];
+            [encoder setBuffer:gpu.attentionMean offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+            [encoder setBytes:&no length:sizeof(no) atIndex:5];
+            int32_t mapped = plan ? 1 : 0;
+            [encoder setBuffer:plan ? plan.perm : gpu.attentionMean offset:0 atIndex:6];
+            [encoder setBytes:&mapped length:sizeof(mapped) atIndex:7];
+            [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
+            [encoder setBuffer:gpu.attentionK8 offset:0 atIndex:1];
+            [encoder setBuffer:gpu.attentionScales offset:k_scale_offset atIndex:2];
+            [encoder setBytes:&yes length:sizeof(yes) atIndex:5];
+            [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (plan) gather(encoder, TENSOR(value).buffer, gpu.attentionVP, plan.perm);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else if (plan) {
+            gather(encoder, TENSOR(query).buffer, gpu.attentionQP, plan.perm);
+            gather(encoder, TENSOR(key).buffer, gpu.attentionKP, plan.perm);
+            gather(encoder, TENSOR(value).buffer, gpu.attentionVP, plan.perm);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        [encoder setComputePipelineState:pipeline];
+        if (plan) {
+            [encoder setBuffer:plan.offsets offset:0 atIndex:7];
+            [encoder setBuffer:plan.indices offset:0 atIndex:8];
+        }
+        if (int8_qk) {
+            [encoder setBuffer:gpu.attentionQ8 offset:0 atIndex:0];
+            [encoder setBuffer:gpu.attentionK8 offset:0 atIndex:1];
+            [encoder setBuffer:gpu.attentionScales offset:0 atIndex:5];
+            [encoder setBuffer:gpu.attentionScales offset:k_scale_offset atIndex:6];
+        } else {
+            [encoder setBuffer:plan ? gpu.attentionQP : TENSOR(query).buffer offset:0 atIndex:0];
+            [encoder setBuffer:plan ? gpu.attentionKP : TENSOR(key).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:6];
+        }
+        [encoder setBuffer:plan ? gpu.attentionVP : TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:plan ? gpu.attentionOP : TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)args.q_blocks, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        if (plan) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            gather(encoder, gpu.attentionOP, TENSOR(output).buffer, plan.inverse);
+        }
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += int8_qk ? 4 : 1;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_has_nax_extras(const h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    return gpu && gpu.attentionLibrary && gpu.tensorOpsEnabled &&
+        h3_gpu_attention_pipeline(gpu, @"h3_linear_bf16_f32out_nax") != nil;
+}
+
+int h3_gpu_linear_bf16_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *weight,
+                                  const h3_gpu_tensor *bias,
+                                  h3_gpu_tensor *scratch, uint32_t rows,
+                                  uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu) return 0;
+    uint32_t padded = (rows + 127u) & ~127u;
+    if (input_dim % 128 || output_dim % 128 ||
+        !h3_gpu_require_elements(gpu, input, (size_t)rows * input_dim, @"mixed linear input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_bf16(gpu, weight, (size_t)output_dim * input_dim, @"mixed linear weight") ||
+        !h3_gpu_require_elements(gpu, scratch, (size_t)padded * input_dim, @"mixed linear scratch") ||
+        TENSOR(scratch).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, output, (size_t)rows * output_dim, @"mixed linear output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_dim, @"mixed linear bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32))) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_attention_pipeline(gpu, @"h3_linear_bf16_f32out_nax");
+    if (!pipeline) {
+        h3_gpu_set_error(gpu, @"NAX mixed-precision linear is unavailable");
+        return 0;
+    }
+    if (!h3_gpu_cast_f32_to_bf16(opaque, scratch, input, (uint32_t)((size_t)rows * input_dim)) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    uint32_t dims[3] = {rows, input_dim, output_dim};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(scratch).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:bias ? TENSOR(bias).buffer : TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(output_dim / 128, padded / 128, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+void h3_gpu_declare_head_major_sdpa_inputs(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (gpu) gpu.headMajorSDPAInputs = YES;
+}
+
 int h3_gpu_sdpa_bf16_head_major_output(
                      h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    const char *mode = h3_attention_mode();
+    if (gpu && gpu.headMajorSDPAInputs &&
+        (!strcmp(mode, "nax") || !strcmp(mode, "int8") ||
+         gpu.attentionPlan.rows == sequence)) {
+        int done = h3_gpu_attention_nax(gpu, output, query, key, value,
+                                        sequence, heads, head_dim, scale,
+                                        !strcmp(mode, "int8"));
+        if (done >= 0) {
+            gpu.headMajorSDPAInputs = NO;
+            return done;
+        }
+    }
     return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
                        head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
                        1);
