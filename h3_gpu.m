@@ -662,9 +662,15 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
-    int transformer_weight = strstr(path, "/transformer/") != NULL;
+    /* The BF16 DiT and the packed INT8 DiT (tools/align_int8_pack.py puts every whole-page tensor on a page). */
+    int transformer_weight = strstr(path, "/transformer/") != NULL ||
+                             strstr(path, "/transformer-int8/") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
-    int map_weight = bytes &&
+    size_t page = (size_t)getpagesize();
+    /* newBufferWithBytesNoCopy needs a page-aligned pointer and a whole number of pages; anything else (unaligned
+       files, small scale/norm tensors) is copied as before. */
+    int mappable = bytes && file_offset % page == 0 && bytes % page == 0;
+    int map_weight = mappable &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          (transformer_weight &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||
@@ -676,7 +682,6 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                              strerror(errno));
             return NULL;
         }
-        size_t page = (size_t)getpagesize();
         uint64_t aligned_offset = file_offset - file_offset % page;
         size_t delta = (size_t)(file_offset - aligned_offset);
         if (bytes > SIZE_MAX - delta) {
