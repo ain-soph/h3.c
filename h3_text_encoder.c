@@ -471,6 +471,27 @@ void h3_text_embedding_free(h3_text_embedding *embedding) {
     memset(embedding, 0, sizeof(*embedding));
 }
 
+
+/* H3_DEBUG_HASH=1: FNV-1a hash of the hidden rows after each layer. */
+static void debug_hash_hidden(const h3_gpu_tensor *hidden, size_t count,
+                              int layer) {
+    if (!getenv("H3_DEBUG_HASH")) return;
+    uint16_t *values = malloc(count * sizeof(*values));
+    if (!values || !h3_gpu_tensor_read_bf16(hidden, values, count)) {
+        free(values);
+        return;
+    }
+    const unsigned char *p = (const unsigned char *)values;
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < count * sizeof(*values); i++) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    fprintf(stderr, "h3 hash text-layer %3d %016llx\n", layer,
+            (unsigned long long)hash);
+    free(values);
+}
+
 static int text_encode_bf16_impl(
                         const char *weight_directory,
                         const char *shader_source_path,
@@ -645,6 +666,7 @@ static int text_encode_bf16_impl(
         }
     }
 
+    debug_hash_hidden(hidden, hidden_count, -1);
     int prefetch_threads = text_prefetch_threads();
     int prefetch_layers = prefetch_threads > 0 && layer_count > 1;
     int prefetch_depth = prefetch_layers ? text_prefetch_depth(gpu) : 0;
@@ -685,6 +707,7 @@ static int text_encode_bf16_impl(
             prefetch_slots_retire(slots, prefetch_depth);
             goto cleanup;
         }
+        debug_hash_hidden(hidden, hidden_count, layer);
         if (progress) progress(layer + 1, TEXT_LAYERS, progress_opaque);
         if (layer + 1 >= layer_count) continue;
 
