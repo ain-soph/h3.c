@@ -1404,13 +1404,17 @@ kernel void h3_attention_gather_rows(const device bfloat *src [[buffer(0)]],
         *(const device uint4 *)(src + head_base + (ulong)rows[row] * 128 + part * 8);
 }
 
-// y[rows][out] (F32) = x[rows][in] (BF16) * w[out][in]^T (BF16) + bias[out] (F32): one 128x128 output tile per
-// threadgroup of four simdgroups, F32 accumulation. `in` and `out` are multiples of 128; x has room for whole
-// 128-row tiles (rows past `rows` are computed and dropped). Used by the video VAE's mixed-precision linears.
+// y[rows][out] (F32) = x[rows][in] (BF16) * w[out][in]^T (BF16) + bias[out] (F32): one 128x64 output tile per
+// threadgroup of four simdgroups, F32 accumulation over 128-wide K steps. `in` is a multiple of 128 and `out` of 64;
+// x has room for whole 128-row tiles (rows past `rows` are computed and dropped). `row_major` walks the row tiles
+// fastest (better when the output is wider than the input). The K order is the same for every tile shape, so the
+// result is bit-identical to the former 128x128 tiles (88-98 vs 46-62 TFLOPS on M5 Ultra: tests/bench_vae_gemm.m).
+// Used by the video VAE's mixed-precision linears.
 struct h3_linear_dims {
     uint rows;
     uint in;
     uint out;
+    uint row_major;
 };
 
 kernel void h3_linear_bf16_f32out_nax(device bfloat *x [[buffer(0)]],
@@ -1418,27 +1422,28 @@ kernel void h3_linear_bf16_f32out_nax(device bfloat *x [[buffer(0)]],
                                       const device float *bias [[buffer(2)]],
                                       device float *y [[buffer(3)]],
                                       constant h3_linear_dims &d [[buffer(4)]],
-                                      uint2 g [[threadgroup_position_in_grid]]) {
-    constexpr int TILE = 128;
-    const uint padded = (d.rows + TILE - 1) & ~uint(TILE - 1);
+                                      uint2 tg [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M = 128, TILE_N = 64, TILE_K = 128;
+    const uint2 g = d.row_major ? uint2(tg.y, tg.x) : tg;  // g.x: column tile, g.y: row tile
+    const uint padded = (d.rows + TILE_M - 1) & ~uint(TILE_M - 1);
     auto X = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(x, dextents<int32_t, 2>(d.in, padded));
     auto W = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(w, dextents<int32_t, 2>(d.in, d.out));
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        TILE_M, TILE_N, TILE_K, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> mm;
-    auto first_x = X.template slice<TILE, TILE>(0, g.y * TILE);
-    auto first_w = W.template slice<TILE, TILE>(0, g.x * TILE);
+    auto first_x = X.template slice<TILE_K, TILE_M>(0, g.y * TILE_M);
+    auto first_w = W.template slice<TILE_K, TILE_N>(0, g.x * TILE_N);
     auto acc = mm.template get_destination_cooperative_tensor<decltype(first_x), decltype(first_w), float>();
     for (ushort e = 0; e < acc.get_capacity(); e++) if (acc.is_valid_element(e)) acc[e] = 0.f;
-    for (uint k = 0; k < d.in; k += TILE) {
-        auto sx = X.template slice<TILE, TILE>(k, g.y * TILE);
-        auto sw = W.template slice<TILE, TILE>(k, g.x * TILE);
+    for (uint k = 0; k < d.in; k += TILE_K) {
+        auto sx = X.template slice<TILE_K, TILE_M>(k, g.y * TILE_M);
+        auto sw = W.template slice<TILE_K, TILE_N>(k, g.x * TILE_N);
         mm.run(sx, sw, acc);
     }
     for (ushort e = 0; e < acc.get_capacity(); e++) {
         if (!acc.is_valid_element(e)) continue;
         auto index = acc.get_multidimensional_index(e);
-        uint row = g.y * TILE + uint(index[1]), col = g.x * TILE + uint(index[0]);
+        uint row = g.y * TILE_M + uint(index[1]), col = g.x * TILE_N + uint(index[0]);
         if (row < d.rows) y[(ulong)row * d.out + col] = acc[e] + (bias ? bias[col] : 0.f);
     }
 }

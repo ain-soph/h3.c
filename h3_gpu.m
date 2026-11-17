@@ -1961,7 +1961,11 @@ int h3_gpu_linear_bf16_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     }
     if (!h3_gpu_cast_f32_to_bf16(opaque, scratch, input, (uint32_t)((size_t)rows * input_dim)) ||
         !h3_gpu_require_command(gpu)) return 0;
-    uint32_t dims[3] = {rows, input_dim, output_dim};
+    /* 128x64 output tiles; walk the row tiles fastest when the output is wider than the input (QKV). */
+    uint32_t row_major = output_dim > input_dim;
+    uint32_t dims[4] = {rows, input_dim, output_dim, row_major};
+    MTLSize groups = row_major ? MTLSizeMake(padded / 128, output_dim / 64, 1)
+                               : MTLSizeMake(output_dim / 64, padded / 128, 1);
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -1970,8 +1974,7 @@ int h3_gpu_linear_bf16_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:bias ? TENSOR(bias).buffer : TENSOR(output).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
         [encoder setBytes:dims length:sizeof(dims) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(output_dim / 128, padded / 128, 1)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
