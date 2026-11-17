@@ -98,6 +98,14 @@ struct h3_dit {
     /* Loaded from a packed checkpoint: INT8 block matrices and AdaLN rows,
      * no BF16 copies to fall back to. */
     int packed;
+    /* H3_DIT_STREAM_WEIGHTS=1 with a zero-copy packed DiT: each block's INT8
+     * matrices get a Metal buffer only while that block is encoded; the
+     * command buffer holds it until the GPU is done, then Metal can unwire the
+     * pages. Commands are committed every stream_map_blocks blocks and the CPU
+     * runs at most stream_map_inflight command buffers ahead of the GPU. */
+    int stream_mapped;
+    unsigned stream_map_blocks;
+    unsigned stream_map_inflight;
     /* H3_SPARSE: block-sparse attention plan over the full sequence (NULL =
      * dense everywhere) and the steps/blocks that stay dense. */
     h3_gpu_attention_plan *sparse;
@@ -601,6 +609,40 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+}
+
+static h3_gpu_tensor **block_mapped_weights(h3_dit_block *block,
+                                            unsigned index) {
+    h3_gpu_tensor **fields[] = {
+        &block->qkv_int8, &block->out_int8, &block->fc1_int8, &block->fc2_int8
+    };
+    return index < 4 ? fields[index] : NULL;
+}
+
+static int attach_block_weights(h3_dit *dit, h3_dit_block *block) {
+    for (unsigned index = 0; index < 4; index++) {
+        h3_gpu_tensor *tensor = *block_mapped_weights(block, index);
+        if (tensor && h3_gpu_tensor_is_mapped(tensor) &&
+            !h3_gpu_tensor_attach(dit->gpu, tensor)) return 0;
+    }
+    return 1;
+}
+
+static void detach_block_weights(h3_dit_block *block) {
+    for (unsigned index = 0; index < 4; index++) {
+        h3_gpu_tensor *tensor = *block_mapped_weights(block, index);
+        if (tensor) (void)h3_gpu_tensor_detach(tensor);
+    }
+}
+
+static unsigned env_unsigned(const char *name, unsigned fallback,
+                             unsigned maximum) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    return end != value && !*end && parsed >= 1 && parsed <= (long)maximum ?
+        (unsigned)parsed : fallback;
 }
 
 static double stream_now(void) {
@@ -1355,6 +1397,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !load_block_packed(dit, &dit->blocks[index], prefix,
                                    error, error_size)) return 0;
+            if (dit->stream_mapped) detach_block_weights(&dit->blocks[index]);
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1844,6 +1887,15 @@ static h3_dit *load_dit(const char *weight_directory,
         }
     }
     dit->packed = h3_dit_schedule_is_packed(dit->weights);
+    {
+        const char *stream_weights = getenv("H3_DIT_STREAM_WEIGHTS");
+        dit->stream_mapped = dit->packed && !dit->ssd_streaming &&
+            stream_weights && !strcmp(stream_weights, "1");
+        dit->stream_map_blocks = env_unsigned("H3_DIT_STREAM_BLOCKS", 1,
+                                              H3_DIT_BLOCKS);
+        dit->stream_map_inflight = env_unsigned("H3_DIT_STREAM_INFLIGHT", 2,
+                                                H3_DIT_BLOCKS);
+    }
     if (dit->packed && !check_packed_options(
             dit, use_slower_bf16_mlp, use_slower_bf16_qkv,
             use_slower_bf16_attention_output, error, error_size))
@@ -2403,7 +2455,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (evaluate_core) {
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
-        if (dit->ssd_streaming) command_blocks = 0;
+        if (dit->ssd_streaming || dit->stream_mapped) command_blocks = 0;
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
@@ -2492,6 +2544,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 stream_started = 1;
             }
+            if (dit->stream_mapped && !attach_block_weights(dit, weight)) {
+                fail(error, error_size, "cannot map DiT block %u weights: %s",
+                     block, h3_gpu_error(dit->gpu));
+                return 0;
+            }
             int block_ok = run_block(
                 dit, block, step, weight, fused_token_adaln,
                 fused_attention_input_quantized,
@@ -2499,6 +2556,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 &carried_attention_adaln,
                 &carried_attention_input_quantized,
                 error, error_size);
+            /* The command buffer keeps the encoded buffers until the GPU is
+             * done with them; dropping ours lets Metal release the pages. */
+            if (dit->stream_mapped) detach_block_weights(weight);
             if (!block_ok) {
                 if (stream_started) (void)pthread_join(stream_thread, NULL);
                 return 0;
@@ -2508,6 +2568,13 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 completed_blocks < dit->active_block_count &&
                 completed_blocks % command_blocks == 0)
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
+            if (dit->stream_mapped &&
+                completed_blocks < dit->active_block_count &&
+                completed_blocks % dit->stream_map_blocks == 0) {
+                OP(h3_gpu_continue(dit->gpu), "continue streamed DiT chain");
+                OP(h3_gpu_retire(dit->gpu, dit->stream_map_inflight),
+                   "retire streamed DiT commands");
+            }
             if (stream_started) {
                 int gpu_ok = gpu_op(dit, h3_gpu_submit(dit->gpu),
                                     error, error_size,
