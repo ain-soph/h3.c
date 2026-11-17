@@ -316,6 +316,23 @@ static void h3_augment_span(float *values, size_t count, uint64_t seed) {
                         0.001f * h3_rng_normal(&rng);
 }
 
+
+/* H3_DEBUG_HASH=1 prints an FNV-1a hash of each pipeline stage's host buffer
+ * (conditioning pixels, VAE latent rows, Qwen vision rows, text context, noise,
+ * denoised latents, decoded frames) to find where two runs diverge. */
+static void h3_debug_hash(const char *label, size_t index, const void *data,
+                          size_t bytes) {
+    if (!getenv("H3_DEBUG_HASH") || !data) return;
+    const unsigned char *p = data;
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < bytes; i++) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    fprintf(stderr, "h3 hash %-18s %zu %016llx (%zu bytes)\n", label, index,
+            (unsigned long long)hash, bytes);
+}
+
 static int h3_augment_conditions(const h3_params *params, int ref2va,
                                  int render_width, int render_height,
                                  const h3_layout_ref *references,
@@ -1318,6 +1335,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             size_t row_elements = (size_t)image_latent_t *
                                   (size_t)image_latent_h *
                                   (size_t)image_latent_w / 4 * 96;
+            h3_debug_hash("pixels", image, condition_pixels[image],
+                (size_t)condition_frames[image] * 3 *
+                (size_t)condition_heights[image] *
+                (size_t)condition_widths[image] * sizeof(float));
             h3_video_latent latent;
             memset(&latent, 0, sizeof(latent));
             if (!h3_video_vae_encode(
@@ -1338,6 +1359,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                     "visual condition VAE produced unexpected latent geometry");
                 goto cleanup;
             }
+            h3_debug_hash("vae-latent", image, latent.values,
+                (size_t)24 * latent.time * latent.height * latent.width *
+                sizeof(float));
             float *rows = condition_video_rows + condition_offset;
             if (!h3_dit_patchify_video(
                     latent.values, 24, image_latent_t,
@@ -1368,6 +1392,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                     h3_set_error(ctx, "%s", detail);
                     goto cleanup;
                 }
+                h3_debug_hash("vision-merged", vision_cursor,
+                    vision_outputs[vision_cursor].merged,
+                    vision_outputs[vision_cursor].tokens *
+                    H3_VISION_OUTPUT_WIDTH * 2);
+                for (unsigned d = 0; d < H3_VISION_DEEPSTACKS; d++)
+                    h3_debug_hash("vision-deepstack", d,
+                        vision_outputs[vision_cursor].deepstack[d],
+                        vision_outputs[vision_cursor].tokens *
+                        H3_VISION_OUTPUT_WIDTH * 2);
                 if (ref2va)
                     presentations[reference_index].vision =
                         &vision_outputs[vision_cursor];
@@ -1446,6 +1479,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    h3_debug_hash("text", 0, text.values, text.tokens * text.width * 2);
+    h3_debug_hash("cond-video", 0, condition_video_rows,
+                  condition_video_elements * sizeof(float));
     conditioned = visual_count != 0 || condition_audio_elements != 0;
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
@@ -1466,6 +1502,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "cannot apply seeded condition augmentation");
         goto cleanup;
     }
+    h3_debug_hash("cond-augmented", 0, condition_video_rows,
+                  condition_video_elements * sizeof(float));
     if (progress.cancelled) goto cleanup;
 
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
@@ -1595,6 +1633,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    h3_debug_hash("noise-video", 0, video, video_count * sizeof(*video));
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
@@ -1610,6 +1649,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         goto cleanup;
     }
+    h3_debug_hash("denoised-video", 0, video, video_count * sizeof(*video));
+    h3_debug_hash("denoised-audio", 0, audio, audio_count * sizeof(*audio));
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
@@ -1654,6 +1695,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (progress.cancelled) goto cleanup;
     size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
                        (size_t)frames.width * 3;
+    h3_debug_hash("frames", 0, frames.rgb, rgb_count * sizeof(float));
     rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
     if (!rgb8) {
         h3_set_error(ctx, "out of memory converting generated RGB frames");

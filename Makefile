@@ -40,6 +40,9 @@ h3_bench_int8: tests/bench_int8.o $(LIB_OBJ)
 h3_bench_attn: tests/bench_attn.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_bench_vae_block: tests/bench_vae_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tests: tests/test_h3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

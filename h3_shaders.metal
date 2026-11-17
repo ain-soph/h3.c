@@ -573,6 +573,7 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = reductions[0] / float(elements);
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* read before reuse */
     local = 0.0f;
     for (uint index = tid; index < elements; index += threadgroup_size.x) {
         uint spatial = index / channels_per_group;
@@ -4003,6 +4004,10 @@ kernel void h3_gqa_causal_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float maximum = reductions[0];
+    /* Every thread must read the maximum before thread 0 overwrites
+     * reductions[0] with its partial sum below; without this barrier long
+     * prompts (multimodal FL2VA/Ref2VA presentations) were not reproducible. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     for (uint key_row = tid; key_row < key_count; key_row += threads) {
         float probability = exp(scores[key_row] - maximum);
