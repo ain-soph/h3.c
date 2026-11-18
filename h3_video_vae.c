@@ -145,6 +145,39 @@ static h3_gpu_tensor *f2(vae_context *vae, const char *name, uint64_t rows,
     return load_f32(vae, name, 2, shape, error, error_size);
 }
 
+static int use_bf16(vae_context *vae);
+
+/* A decoder block matrix. The checkpoint may store it in BF16 (written by
+ * tools/vae_bf16.py): with H3_VAE_BF16 that is exactly the weight the F32
+ * checkpoint is rounded to at load, so it is loaded as is; the F32 path widens
+ * it. *stored_bf16 tells the caller not to convert it again. */
+static h3_gpu_tensor *block_matrix(vae_context *vae, const char *name,
+                                   uint64_t rows, uint64_t columns,
+                                   int *stored_bf16, char *error,
+                                   size_t error_size) {
+    const h3_st_tensor *tensor = h3_weight_find(vae->weights, name, NULL);
+    *stored_bf16 = tensor && tensor->dtype == H3_DTYPE_BF16;
+    if (!*stored_bf16) return f2(vae, name, rows, columns, error, error_size);
+    uint64_t shape[] = {rows, columns};
+    h3_gpu_tensor *weight = h3_weight_load_bf16(vae->weights, vae->gpu, name, 2,
+                                                shape, error, error_size);
+    if (!weight || use_bf16(vae)) return weight;
+    h3_gpu_tensor *widened = h3_gpu_tensor_new_f32(vae->gpu, rows * columns);
+    int ok = widened && h3_gpu_begin(vae->gpu) &&
+             h3_gpu_cast_bf16_to_f32(vae->gpu, widened, weight,
+                                     (uint32_t)(rows * columns)) &&
+             h3_gpu_submit(vae->gpu);
+    h3_gpu_tensor_free(weight);
+    if (!ok) {
+        h3_gpu_tensor_free(widened);
+        fail(error, error_size, "cannot widen %s to F32: %s", name,
+             h3_gpu_error(vae->gpu));
+        return NULL;
+    }
+    *stored_bf16 = 0;
+    return widened;
+}
+
 static void free_block(vae_block *block) {
     free_tensor(&block->norm1); free_tensor(&block->qkv_w);
     free_tensor(&block->qkv_b); free_tensor(&block->out_w);
@@ -203,21 +236,23 @@ static int load_block(vae_context *vae, int index, char *error,
     block->field = f1(vae, name, width, error, error_size);                     \
     if (!block->field) return 0;                                                \
 } while (0)
-#define F2(field, suffix, rows, columns) do {                                   \
+#define F2(field, suffix, rows, columns, slot) do {                             \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
-    block->field = f2(vae, name, rows, columns, error, error_size);             \
+    block->field = block_matrix(vae, name, rows, columns, &stored[slot],       \
+                                error, error_size);                             \
     if (!block->field) return 0;                                                \
 } while (0)
+    int stored[4] = {0};
     F1(norm1, "norm1.weight", HIDDEN);
-    F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+    F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN, 0);
     F1(qkv_b, "attn.to_qkv.bias", INNER * 3);
-    F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
+    F2(out_w, "attn.to_out.weight", HIDDEN, INNER, 1);
     F1(out_b, "attn.to_out.bias", HIDDEN);
     F1(scale1, "scale1", HIDDEN);
     F1(norm2, "norm2.weight", HIDDEN);
-    F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
+    F2(w1, "ff.w1.weight", FFN * 2, HIDDEN, 2);
     F1(w1_b, "ff.w1.bias", FFN * 2);
-    F2(w2, "ff.w2.weight", HIDDEN, FFN);
+    F2(w2, "ff.w2.weight", HIDDEN, FFN, 3);
     F1(w2_b, "ff.w2.bias", HIDDEN);
     F1(scale2, "scale2", HIDDEN);
 #undef F1
@@ -232,9 +267,10 @@ static int load_block(vae_context *vae, int index, char *error,
         h3_gpu_tensor *converted[4] = {0};
         int ok = h3_gpu_begin(vae->gpu);
         for (int i = 0; ok && i < 4; i++)
-            ok = to_bf16(vae, fields[i], sizes[i], &converted[i]);
+            ok = stored[i] || to_bf16(vae, fields[i], sizes[i], &converted[i]);
         ok = ok && h3_gpu_submit(vae->gpu);
         for (int i = 0; i < 4; i++) {
+            if (stored[i]) continue;
             if (ok) {
                 free_tensor(fields[i]);
                 *fields[i] = converted[i];
