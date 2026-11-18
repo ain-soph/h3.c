@@ -9,6 +9,7 @@
 > | VAE linear tiles 128×64 | 46–62 TFLOPS with 128×128 | always | 768p VAE 33.6 → 25.0 s; byte-identical |
 > | NAX attention, block-sparse attention, token reduction | approximate fast preset | `H3_ATTN=nax`, `H3_SPARSE=...`, `H3_TOKEN_REDUCTION` (off) | 768p 5 s fast 412 → 170 s; approximate, composition may change |
 > | Threadgroup race fixes (causal GQA softmax, VAE group norm) | long prompts and conditioned renders were irreproducible | always | same request → same MP4; speed unchanged |
+> | INT8 text encoder shared with H3 image (`FL2VA/text_encoder-int8/`) | the BF16 Qwen3-VL encoder is 62 GB and reads ~49 GB per render; the H3 image INT8 convrot file holds the same weights | used when `text_encoder-int8/h3-te-int8.json` exists (`H3_TE=bf16` forces BF16); W8A16 per class (`H3_QWEN_W8A16`) | text encoder 3.0–3.7 → 2.4–2.5 s, reads 49 → 24 GB, 62 GB of BF16 no longer needed; output rel. RMS 0.4–0.6%; 768p render PSNR 28 dB vs BF16 (same composition) |
 >
 > Full numbers: [MiniMax H3 Video in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#视频音频minimax-h3-video). Upstream PRs: [#98](https://github.com/antirez/h3.c/pull/98), [#99](https://github.com/antirez/h3.c/pull/99) (open).
 
