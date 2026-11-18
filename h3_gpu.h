@@ -73,6 +73,11 @@ int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
                               uint64_t file_offset,
                               char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
+/* Zero-copy (file-mapped) tensors only: detach drops the Metal buffer but keeps the mapping, so Metal can unwire the
+ * pages once no command buffer holds the buffer; attach makes a new buffer over the same pages. */
+int h3_gpu_tensor_is_mapped(const h3_gpu_tensor *tensor);
+int h3_gpu_tensor_detach(h3_gpu_tensor *tensor);
+int h3_gpu_tensor_attach(h3_gpu *gpu, h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
@@ -99,6 +104,9 @@ int h3_gpu_begin(h3_gpu *gpu);
 /* Commit the current command buffer without waiting, then continue encoding on
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
+/* Waits for the oldest committed command buffers until at most `keep` are still in flight (the GPU keeps working on
+ * the newer ones). */
+int h3_gpu_retire(h3_gpu *gpu, unsigned keep);
 int h3_gpu_submit(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);

@@ -18,6 +18,19 @@
 #include <unistd.h>
 
 @class H3GPU;
+
+/* A read-only file mapping behind zero-copy weight buffers. Every MTLBuffer made over it keeps it alive through its
+   deallocator, so a buffer that a command buffer still holds outlives the tensor that dropped it. */
+@interface H3Mapping : NSObject
+@property(nonatomic) void *mapping;
+@property(nonatomic) size_t mapBytes;
+@property(nonatomic) void *values;
+@end
+@implementation H3Mapping
+- (void)dealloc {
+    if (_mapping) munmap(_mapping, _mapBytes);
+}
+@end
 @interface H3Tensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
 @property(nonatomic) size_t elements;
@@ -27,6 +40,7 @@
 @property(nonatomic, strong) MPSGraphTensorData *graphData;
 @property(nonatomic, strong) NSArray<NSNumber *> *graphDataShape;
 @property(nonatomic) MPSDataType graphDataType;
+@property(nonatomic, strong) H3Mapping *mapping;
 @end
 @implementation H3Tensor
 @end
@@ -650,6 +664,50 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
 }
 
+static id<MTLBuffer> h3_gpu_mapped_buffer(H3GPU *gpu, H3Mapping *file_map,
+                                          size_t bytes) {
+    return [gpu.device newBufferWithBytesNoCopy:file_map.values
+                                         length:MAX(bytes, (size_t)1)
+                                        options:MTLResourceStorageModeShared
+                                    deallocator:^(void *pointer, NSUInteger length) {
+        (void)pointer;
+        (void)length;
+        (void)file_map;  /* keeps the mapping until Metal releases the buffer */
+    }];
+}
+
+int h3_gpu_tensor_is_mapped(const h3_gpu_tensor *tensor) {
+    return tensor && TENSOR(tensor).mapping != nil;
+}
+
+int h3_gpu_tensor_detach(h3_gpu_tensor *opaque) {
+    if (!opaque) return 0;
+    H3Tensor *tensor = TENSOR(opaque);
+    if (!tensor.mapping) return 0;
+    @autoreleasepool {
+        tensor.graphData = nil;
+        tensor.graphDataShape = nil;
+        tensor.buffer = nil;
+    }
+    return 1;
+}
+
+int h3_gpu_tensor_attach(h3_gpu *opaque, h3_gpu_tensor *tensor_opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !tensor_opaque) return 0;
+    H3Tensor *tensor = TENSOR(tensor_opaque);
+    if (tensor.buffer) return 1;
+    if (!tensor.mapping) return 0;
+    @autoreleasepool {
+        tensor.buffer = h3_gpu_mapped_buffer(gpu, tensor.mapping, tensor.bytes);
+    }
+    if (!tensor.buffer) {
+        h3_gpu_set_error(gpu, @"cannot map %zu-byte Metal buffer", tensor.bytes);
+        return 0;
+    }
+    return 1;
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                                               uint64_t file_offset,
                                               size_t elements,
@@ -698,17 +756,12 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                              path, strerror(map_error));
             return NULL;
         }
-        void *values = (unsigned char *)mapping + delta;
-        id<MTLBuffer> buffer = [gpu.device
-            newBufferWithBytesNoCopy:values length:MAX(bytes, (size_t)1)
-            options:MTLResourceStorageModeShared
-            deallocator:^(void *pointer, NSUInteger length) {
-                (void)pointer;
-                (void)length;
-                munmap(mapping, map_bytes);
-            }];
+        H3Mapping *file_map = [[H3Mapping alloc] init];
+        file_map.mapping = mapping;
+        file_map.mapBytes = map_bytes;
+        file_map.values = (unsigned char *)mapping + delta;
+        id<MTLBuffer> buffer = h3_gpu_mapped_buffer(gpu, file_map, bytes);
         if (!buffer) {
-            munmap(mapping, map_bytes);
             h3_gpu_set_error(gpu, @"cannot map %zu-byte Metal buffer", bytes);
             return NULL;
         }
@@ -717,6 +770,7 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
         tensor.bytes = bytes;
         tensor.dtype = dtype;
         tensor.buffer = buffer;
+        tensor.mapping = file_map;
         tensor.owner = gpu;
         h3_gpu_stats stats = gpu.stats;
         stats.allocated_bytes += bytes;
@@ -1002,6 +1056,30 @@ int h3_gpu_continue(h3_gpu *opaque) {
         return 0;
     }
     gpu.commandStartWall = h3_gpu_now();
+    return 1;
+}
+
+int h3_gpu_retire(h3_gpu *opaque, unsigned keep) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu) return 0;
+    @autoreleasepool {
+        while (gpu.inflightCommands.count > keep) {
+            id<MTLCommandBuffer> oldest = gpu.inflightCommands.firstObject;
+            double wait_started = h3_gpu_now();
+            [oldest waitUntilCompleted];
+            h3_gpu_stats stats = gpu.stats;
+            stats.command_wait_seconds += h3_gpu_now() - wait_started;
+            if (oldest.GPUEndTime >= oldest.GPUStartTime)
+                stats.gpu_seconds += oldest.GPUEndTime - oldest.GPUStartTime;
+            gpu.stats = stats;
+            if (oldest.status == MTLCommandBufferStatusError) {
+                h3_gpu_set_error(gpu, @"Metal command failed: %@",
+                                 oldest.error.localizedDescription);
+                return 0;
+            }
+            [gpu.inflightCommands removeObjectAtIndex:0];
+        }
+    }
     return 1;
 }
 
