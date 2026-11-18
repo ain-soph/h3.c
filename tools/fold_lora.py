@@ -17,8 +17,17 @@ Layout differences against the released shards (see diffusers' convert_minimax_h
   - diffusers' ff.net.0.proj is the shards' mlp.fc1 with its two halves swapped ([value; gate] vs [gate; value]).
 A per-tensor probe checks the folded rows against W x + scale * B (A x) before any byte is written.
 
+Rounding: a LoRA delta is ~0.01-0.05 % of W, mostly below half a BF16 ulp, and W is already on the BF16 grid, so
+round-to-nearest gives W back for most weights: measured, only 10-55 % of the delta survives in blocks 0-25
+(regression of the folded output on B(A x)). --rounding stochastic (the default) rounds W + delta up or down with
+probability proportional to the distance, which keeps the delta in expectation (measured 1.00 +- 0.01, also after
+INT8 packing); the added noise is 0.2-0.35x the INT8 rounding noise of the packed DiT and ~0.5x the BF16 rounding of
+the adaLN table. It is seeded per tensor, so a fold is reproducible.
+Folding is one-way: fold into a fresh copy of the released shards (subtracting the delta again leaves 0.03-0.2 %
+of the values one ulp off, measured).
+
 Usage: tools/fold_lora.py SRC/transformer LORA.safetensors [--scale 1.0] [--qkv-layout contiguous|interleaved]
-       [--dry-run]   (lists the mapping and checks shapes without writing)
+       [--rounding stochastic|nearest] [--dry-run]   (--dry-run lists the mapping, writes nothing)
 """
 import argparse
 import json
@@ -50,9 +59,13 @@ def load(path, spec, base):
     sys.exit(f"unsupported dtype {spec['dtype']}")
 
 
-def to_bf16(x):
+def to_bf16(x, seed=None):
+    """BF16 bytes of x: round to nearest even, or stochastically with a seeded generator."""
     u = np.ascontiguousarray(x, np.float32).view(np.uint32)
-    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2").tobytes()
+    if seed is None:
+        return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2").tobytes()
+    noise = np.random.default_rng(seed).integers(0, 1 << 16, size=u.shape, dtype=np.uint32)
+    return ((u + noise) >> 16).astype("<u2").tobytes()
 
 
 DIFFUSERS = [  # (pattern, native replacement)
@@ -87,6 +100,7 @@ def main():
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--qkv-layout", choices=("contiguous", "interleaved"), default="contiguous",
                     help="row layout of the adapter's QKV deltas (reference / diffusers models: contiguous)")
+    ap.add_argument("--rounding", choices=("stochastic", "nearest"), default="stochastic")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     cfg = json.loads((args.checkpoint / "config.json").read_text())
@@ -158,7 +172,7 @@ def main():
         if rel > 1e-4:
             sys.exit(f"{key}: probe failed (rel {rel:.2e})")
         a, b = spec["data_offsets"]
-        data = to_bf16(folded)
+        data = to_bf16(folded, n if args.rounding == "stochastic" else None)
         if len(data) != b - a:
             sys.exit(f"{key}: byte count")
         with open(shard, "r+b") as f:
@@ -166,7 +180,7 @@ def main():
             f.write(data)
         rms = float(np.sqrt(np.mean(delta * delta)) / (np.sqrt(np.mean(W * W)) + 1e-12))
         print(f"  [{n + 1}/{len(plan)}] {key}: |dW|/|W| {rms:.4f}", flush=True)
-    print("dry run" if args.dry_run else "folded")
+    print("dry run" if args.dry_run else f"folded ({args.rounding} rounding)")
 
 
 if __name__ == "__main__":
