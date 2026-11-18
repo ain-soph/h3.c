@@ -4335,3 +4335,46 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* ComfyUI "convrot" INT8 weights (the H3 image text encoder) were quantized
+ * after multiplying each 256-wide K group by H256 = (H4 / 2)^{(x)4}, where
+ * H4[d][e] = -1 when d + e == 3 and 1 otherwise. H256 is symmetric and
+ * orthogonal, so W x == (W H256)(H256 x): rotate each activation group the
+ * same way before the product. One threadgroup per (row, group), four radix-4
+ * stages, one element per thread. */
+kernel void h3_rotate256_bf16(device const ushort *input [[buffer(0)]],
+                              device ushort *output [[buffer(1)]],
+                              constant uint &columns [[buffer(2)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float values[256];
+    uint base = group.y * columns + group.x * 256u;
+    values[tid] = h3_bf16_to_f32(input[base + tid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1; stride < 256u; stride *= 4u) {
+        uint digit = ((uint)tid / stride) & 3u;
+        uint first = (uint)tid - digit * stride;
+        float sum = 0.0f;
+        for (uint other = 0; other < 4u; other++) {
+            float value = values[first + other * stride];
+            sum += digit + other == 3u ? -value : value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        values[tid] = 0.5f * sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[base + tid] = h3_f32_to_bf16(values[tid]);
+}
+
+/* W8A16 helper: BF16 = INT8 * per-row F32 scale, four values per thread. */
+kernel void h3_dequantize_int8_rows_bf16(device const char4 *weight [[buffer(0)]],
+                                         device const float *scales [[buffer(1)]],
+                                         device ushort4 *output [[buffer(2)]],
+                                         constant uint2 &shape [[buffer(3)]],
+                                         uint gid [[thread_position_in_grid]]) {
+    uint per_row = shape.y / 4u;
+    if (gid >= shape.x * per_row) return;
+    float4 value = float4(weight[gid]) * scales[gid / per_row];
+    output[gid] = ushort4(h3_f32_to_bf16(value.x), h3_f32_to_bf16(value.y),
+                          h3_f32_to_bf16(value.z), h3_f32_to_bf16(value.w));
+}

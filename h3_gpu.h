@@ -368,6 +368,16 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
                          int input_is_quantized);
+/* Multiply each 256-wide group of every row by the ConvRot Hadamard matrix
+ * (input of a linear whose INT8 weights were quantized in the rotated basis). */
+int h3_gpu_rotate256_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input, uint32_t rows,
+                          uint32_t columns);
+/* BF16 = INT8 x per-row F32 scale (W8A16 through the BF16 linear). */
+int h3_gpu_dequantize_int8_rows_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *weight,
+                                     const h3_gpu_tensor *scales,
+                                     uint32_t rows, uint32_t columns);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

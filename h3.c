@@ -438,6 +438,22 @@ static const char *h3_dit_relative(const h3_ctx *ctx, int ref2va) {
     return has_packed ? packed : bf16;
 }
 
+/* Prefer FL2VA/text_encoder-int8 (the H3 image text encoder's INT8 convrot
+ * file, same Qwen3-VL weights; marker h3-te-int8.json) over the BF16 text
+ * encoder. Both variants share it. H3_TE=bf16 or H3_TE=int8 forces one. */
+static const char *h3_text_relative(const h3_ctx *ctx, int ref2va) {
+    const char *bf16 = ref2va ? "Ref2VA/text_encoder" : "FL2VA/text_encoder";
+    const char *int8 = "FL2VA/text_encoder-int8";
+    const char *forced = getenv("H3_TE");
+    if (forced && !strcmp(forced, "bf16")) return bf16;
+    if (forced && !strcmp(forced, "int8")) return int8;
+    char *marker = h3_path(ctx->model_dir,
+                           "FL2VA/text_encoder-int8/h3-te-int8.json");
+    int has_int8 = marker && h3_is_file(marker);
+    free(marker);
+    return has_int8 ? int8 : bf16;
+}
+
 h3_ctx *h3_load_dir(const char *model_dir) {
     h3_global_error[0] = '\0';
     if (!model_dir || !*model_dir) {
@@ -460,7 +476,8 @@ h3_ctx *h3_load_dir(const char *model_dir) {
     snprintf(fl2va_config, sizeof(fl2va_config), "%s/config.json", fl2va_dit);
     if (!h3_require_file(ctx, fl2va_config) ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
+        !h3_inventory(ctx, h3_text_relative(ctx, 0),
+                      &ctx->model.text_encoder) ||
         !h3_inventory(ctx, fl2va_dit, &ctx->model.fl2va_transformer) ||
         !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
@@ -960,8 +977,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int decoder_is_cached = 0;
     char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
-    char *text_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/text_encoder" : "FL2VA/text_encoder");
+    char *text_path = h3_path(ctx->model_dir, h3_text_relative(ctx, ref2va));
     char *dit_path = h3_path(ctx->model_dir, h3_dit_relative(ctx, ref2va));
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
