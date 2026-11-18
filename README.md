@@ -1,3 +1,17 @@
+> **ain-soph fork (`serving` branch, based on upstream `8974cc0` + upstream PR #77 (`0a95ea1`)).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Packed INT8 DiT (`h3_pack_int8`) | on-the-fly BF16 → INT8 at every load | offline tool; used when `<variant>/transformer-int8/` exists | DiT 66.3 → 23.9 GB per checkpoint; 512×288 25 frames 28.9 → 18.0 s; T2V byte-identical |
+> | Zero-copy INT8 DiT (`tools/align_int8_pack.py`) | map weights instead of copying them | default on M5 when page-aligned (`H3_ZERO_COPY_WEIGHTS`) | DiT load 2.29 → 0.33 s; byte-identical |
+> | Per-block DiT Metal buffers | Metal wires a buffer as long as it lives | `H3_DIT_STREAM_WEIGHTS` (default on) | 768p wired 21.9 → 14.3 GB; same speed; byte-identical |
+> | BF16 video VAE (TensorOps) | FP32 VAE decode is slow | `H3_VAE_BF16=2` (off; `1` = linears only) | 768p VAE 79.0 → 33.6 s; PSNR 51.7 dB (linear-only variant) |
+> | VAE linear tiles 128×64 | 46–62 TFLOPS with 128×128 | always | 768p VAE 33.6 → 25.0 s; byte-identical |
+> | NAX attention, block-sparse attention, token reduction | approximate fast preset | `H3_ATTN=nax`, `H3_SPARSE=...`, `H3_TOKEN_REDUCTION` (off) | 768p 5 s fast 412 → 170 s; approximate, composition may change |
+> | Threadgroup race fixes (causal GQA softmax, VAE group norm) | long prompts and conditioned renders were irreproducible | always | same request → same MP4; speed unchanged |
+>
+> Full numbers: [MiniMax H3 Video in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#视频音频minimax-h3-video). Upstream PRs: [#98](https://github.com/antirez/h3.c/pull/98), [#99](https://github.com/antirez/h3.c/pull/99) (open).
+
 # h3-metal
 
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
