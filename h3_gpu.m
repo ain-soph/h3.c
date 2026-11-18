@@ -484,6 +484,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
+            @"h3_rotate256_bf16", @"h3_dequantize_int8_rows_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
@@ -3464,7 +3465,9 @@ static int h3_gpu_linear_int8_bf16_layout(
                             uint32_t headDim) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
-    if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
+    /* Fewer than 128 rows (Qwen text prompts) work too: the quantizer
+     * zero-fills the padded rows and the GEMM stores only rows < args.rows. */
+    if (!gpu.tensorOpsEnabled || !rows || input_dim % 128 ||
         output_dim % 128 ||
         !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
                            @"int8 linear weight") ||
@@ -3758,6 +3761,60 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         gpu.stats = stats;
     }
     return 1;
+}
+
+int h3_gpu_rotate256_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input, uint32_t rows,
+                          uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * columns;
+    if (!rows || !columns || (columns % 256u) ||
+        !h3_gpu_require_bf16(gpu, input, count, @"rotation input") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"rotation output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_rotate256_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the 256-group rotation");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBytes:&columns length:sizeof(columns) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(columns / 256u, rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_dequantize_int8_rows_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *weight,
+                                     const h3_gpu_tensor *scales,
+                                     uint32_t rows, uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * columns;
+    if (!rows || (columns % 4u) || count / 4u > UINT32_MAX ||
+        !h3_gpu_require_i8(gpu, weight, count, @"int8 weight") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"int8 weight scales") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"dequantized weight"))
+        return 0;
+    uint64_t shape = (uint64_t)rows | ((uint64_t)columns << 32);
+    return h3_gpu_dispatch_1d(gpu, @"h3_dequantize_int8_rows_bf16",
+                              (uint32_t)(count / 4u),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&shape length:sizeof(shape) atIndex:3];
+        });
 }
 
 int h3_gpu_silu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

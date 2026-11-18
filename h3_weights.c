@@ -126,17 +126,42 @@ size_t h3_weight_store_shards(const h3_weight_store *store) {
     return store ? store->count : 0;
 }
 
-const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
-                                   const char *name,
-                                   const h3_st_header **header) {
-    if (header) *header = NULL;
-    if (!store || !name) return NULL;
+static const h3_st_tensor *weight_find_exact(const h3_weight_store *store,
+                                             const char *name,
+                                             const h3_st_header **header) {
     for (size_t index = 0; index < store->count; index++) {
         const h3_st_tensor *tensor = h3_st_find(&store->headers[index], name);
         if (tensor) {
             if (header) *header = &store->headers[index];
             return tensor;
         }
+    }
+    return NULL;
+}
+
+/* The ComfyUI H3 image text encoder (qwen3vl_32b_minimax_h3_int8_convrot)
+ * stores the same Qwen3-VL weights under the plain Qwen3-VL names. Fall back
+ * to those so one file serves both models. */
+const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
+                                   const char *name,
+                                   const h3_st_header **header) {
+    if (header) *header = NULL;
+    if (!store || !name) return NULL;
+    const h3_st_tensor *tensor = weight_find_exact(store, name, header);
+    if (tensor) return tensor;
+    static const char *const aliases[][2] = {
+        {"model.language_model.", "model."},
+        {"model.visual.", "visual."},
+    };
+    for (size_t index = 0; index < sizeof(aliases) / sizeof(*aliases);
+         index++) {
+        size_t length = strlen(aliases[index][0]);
+        if (strncmp(name, aliases[index][0], length)) continue;
+        char alias[256];
+        int written = snprintf(alias, sizeof(alias), "%s%s",
+                               aliases[index][1], name + length);
+        if (written < 0 || (size_t)written >= sizeof(alias)) return NULL;
+        return weight_find_exact(store, alias, header);
     }
     return NULL;
 }

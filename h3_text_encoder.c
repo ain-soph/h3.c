@@ -20,7 +20,7 @@ enum {
     TEXT_QUERY_DIM = TEXT_QUERY_HEADS * TEXT_HEAD_DIM,
     TEXT_KV_DIM = TEXT_KV_HEADS * TEXT_HEAD_DIM,
     TEXT_ROPE_HALF = TEXT_HEAD_DIM / 2,
-    TEXT_DEFERRED_WEIGHTS = 1 + TEXT_LAYERS * 11
+    TEXT_DEFERRED_WEIGHTS = 1 + TEXT_LAYERS * 18
 };
 
 static const float TEXT_RMS_EPSILON = 1e-6f;
@@ -47,7 +47,41 @@ typedef struct {
     h3_gpu_tensor *gate;
     h3_gpu_tensor *up;
     h3_gpu_tensor *down;
+    /* INT8 checkpoint (ComfyUI convrot: rotated K groups, one F32 scale per
+     * output row). Indexed by text_matrix; the BF16 fields above stay NULL. */
+    h3_gpu_tensor *int8[7];
+    h3_gpu_tensor *int8_scales[7];
 } text_layer_weights;
+
+typedef enum {
+    TEXT_Q, TEXT_K, TEXT_V, TEXT_O, TEXT_GATE, TEXT_UP, TEXT_DOWN,
+    TEXT_MATRICES
+} text_matrix;
+
+static const struct {
+    const char *suffix;
+    const char *flag;
+    uint32_t rows;
+    uint32_t columns;
+} text_matrices[TEXT_MATRICES] = {
+    {"self_attn.q_proj.weight", "q", TEXT_QUERY_DIM, TEXT_HIDDEN},
+    {"self_attn.k_proj.weight", "k", TEXT_KV_DIM, TEXT_HIDDEN},
+    {"self_attn.v_proj.weight", "v", TEXT_KV_DIM, TEXT_HIDDEN},
+    {"self_attn.o_proj.weight", "o", TEXT_HIDDEN, TEXT_QUERY_DIM},
+    {"mlp.gate_proj.weight", "gate", TEXT_INTERMEDIATE, TEXT_HIDDEN},
+    {"mlp.up_proj.weight", "up", TEXT_INTERMEDIATE, TEXT_HIDDEN},
+    {"mlp.down_proj.weight", "down", TEXT_HIDDEN, TEXT_INTERMEDIATE},
+};
+
+/* Scratch for the INT8 path: rotated BF16 input, its INT8 copy and row
+ * scales (W8A8), and one dequantized BF16 matrix (W8A16). */
+typedef struct {
+    h3_gpu_tensor *rotated;
+    h3_gpu_tensor *quantized;
+    h3_gpu_tensor *quantized_scales;
+    h3_gpu_tensor *dequantized;
+    unsigned w8a16;
+} text_int8_scratch;
 
 typedef struct {
     const h3_weight_store *store;
@@ -121,6 +155,53 @@ static h3_gpu_tensor *load_2d(load_context *load, const char *name,
                                             load->error_size));
 }
 
+static int store_is_int8(const h3_weight_store *store) {
+    const h3_st_tensor *tensor = h3_weight_find(
+        store, "model.language_model.layers.0.self_attn.q_proj.weight", NULL);
+    return tensor && tensor->dtype == H3_DTYPE_I8;
+}
+
+static void int8_scale_name(char *scale, size_t size, const char *weight) {
+    /* "...q_proj.weight" -> "...q_proj.weight_scale" */
+    snprintf(scale, size, "%s_scale", weight);
+}
+
+static int load_int8_matrix(load_context *load, const char *prefix,
+                            text_layer_weights *weights, int matrix) {
+    char name[192], scale[208];
+    snprintf(name, sizeof(name), "%s%s", prefix,
+             text_matrices[matrix].suffix);
+    int8_scale_name(scale, sizeof(scale), name);
+    uint64_t shape[] = {text_matrices[matrix].rows,
+                        text_matrices[matrix].columns};
+    uint64_t scale_shape[] = {text_matrices[matrix].rows, 1};
+    weights->int8[matrix] = defer(load, h3_weight_load_i8(
+        load->store, load->gpu, name, 2, shape, load->error,
+        load->error_size));
+    if (!weights->int8[matrix]) return 0;
+    weights->int8_scales[matrix] = defer(load, h3_weight_load_f32(
+        load->store, load->gpu, scale, 2, scale_shape, load->error,
+        load->error_size));
+    return weights->int8_scales[matrix] != NULL;
+}
+
+/* H3_QWEN_W8A16=q,k,v,o,gate,up,down|all|none picks the INT8 matrices that
+ * run with BF16 activations (dequantized weight) instead of INT8 ones. */
+static unsigned text_w8a16_mask(void) {
+    const char *value = getenv("H3_QWEN_W8A16");
+    if (!value) value = "all";
+    if (!strcmp(value, "all")) return (1u << TEXT_MATRICES) - 1u;
+    unsigned mask = 0;
+    char copy[128];
+    snprintf(copy, sizeof(copy), "%s", value);
+    for (char *item = strtok(copy, ","); item; item = strtok(NULL, ",")) {
+        for (int matrix = 0; matrix < TEXT_MATRICES; matrix++)
+            if (!strcmp(item, text_matrices[matrix].flag))
+                mask |= 1u << matrix;
+    }
+    return mask;
+}
+
 static int text_prefetch_threads(void) {
     const char *value = getenv("H3_QWEN_PREFETCH");
     if (!value || !*value) return 8;
@@ -163,6 +244,15 @@ static int layer_weights_load(load_context *load, int layer,
     weights->field = load_2d(load, name, rows, columns);                        \
     if (!weights->field) return 0;                                              \
 } while (0)
+    if (store_is_int8(load->store)) {
+        LOAD_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
+        LOAD_1D(query_norm, "self_attn.q_norm.weight", TEXT_HEAD_DIM);
+        LOAD_1D(key_norm, "self_attn.k_norm.weight", TEXT_HEAD_DIM);
+        LOAD_1D(post_norm, "post_attention_layernorm.weight", TEXT_HIDDEN);
+        for (int matrix = 0; matrix < TEXT_MATRICES; matrix++)
+            if (!load_int8_matrix(load, prefix, weights, matrix)) return 0;
+        return 1;
+    }
     LOAD_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
     LOAD_2D(query, "self_attn.q_proj.weight", TEXT_QUERY_DIM, TEXT_HIDDEN);
     LOAD_2D(key, "self_attn.k_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
@@ -197,6 +287,26 @@ static int layer_weights_allocate(load_context *load,
     weights->field = allocate_bf16(load, (elements));                          \
     if (!weights->field) return 0;                                              \
 } while (0)
+    if (store_is_int8(load->store)) {
+        ALLOCATE(input_norm, TEXT_HIDDEN);
+        ALLOCATE(query_norm, TEXT_HEAD_DIM);
+        ALLOCATE(key_norm, TEXT_HEAD_DIM);
+        ALLOCATE(post_norm, TEXT_HIDDEN);
+        for (int matrix = 0; matrix < TEXT_MATRICES; matrix++) {
+            size_t rows = text_matrices[matrix].rows;
+            weights->int8[matrix] = defer(load, h3_gpu_tensor_new_i8(
+                load->gpu, rows * text_matrices[matrix].columns));
+            weights->int8_scales[matrix] = defer(load,
+                h3_gpu_tensor_new_f32(load->gpu, rows));
+            if (!weights->int8[matrix] || !weights->int8_scales[matrix]) {
+                fail(load->error, load->error_size,
+                     "cannot allocate prefetched Qwen INT8 weight: %s",
+                     h3_gpu_error(load->gpu));
+                return 0;
+            }
+        }
+        return 1;
+    }
     ALLOCATE(input_norm, TEXT_HIDDEN);
     ALLOCATE(query, (size_t)TEXT_QUERY_DIM * TEXT_HIDDEN);
     ALLOCATE(key, (size_t)TEXT_KV_DIM * TEXT_HIDDEN);
@@ -253,6 +363,26 @@ static int read_weight_bf16(const h3_weight_store *store, const char *name,
     return 1;
 }
 
+static int read_weight_raw(const h3_weight_store *store, const char *name,
+                           h3_dtype dtype, uint64_t rows, uint64_t columns,
+                           h3_gpu_tensor *destination,
+                           char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    if (tensor->dtype != dtype || tensor->ndim != 2 ||
+        tensor->shape[0] != rows || tensor->shape[1] != columns) {
+        fail(error, error_size, "weight %s has an unexpected dtype or shape",
+             name);
+        return 0;
+    }
+    return h3_gpu_tensor_stream_file(destination, header->path,
+                                     tensor->file_offset, error, error_size);
+}
+
 static int layer_weights_read_lane(const h3_weight_store *store, int layer,
                                    text_layer_weights *weights,
                                    int lane, int lanes,
@@ -283,6 +413,31 @@ static int layer_weights_read_lane(const h3_weight_store *store, int layer,
                           error, error_size)) return 0;                         \
 } while (0)
     int item = 0;
+    if (store_is_int8(store)) {
+        READ_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
+        READ_1D(query_norm, "self_attn.q_norm.weight", TEXT_HEAD_DIM);
+        READ_1D(key_norm, "self_attn.k_norm.weight", TEXT_HEAD_DIM);
+        READ_1D(post_norm, "post_attention_layernorm.weight", TEXT_HIDDEN);
+        for (int matrix = 0; matrix < TEXT_MATRICES; matrix++) {
+            char name[192], scale[208];
+            snprintf(name, sizeof(name), "%s%s", prefix,
+                     text_matrices[matrix].suffix);
+            int8_scale_name(scale, sizeof(scale), name);
+            if (item++ % lanes == lane &&
+                !read_weight_raw(store, name, H3_DTYPE_I8,
+                                 text_matrices[matrix].rows,
+                                 text_matrices[matrix].columns,
+                                 weights->int8[matrix], error, error_size))
+                return 0;
+            if (item++ % lanes == lane &&
+                !read_weight_raw(store, scale, H3_DTYPE_F32,
+                                 text_matrices[matrix].rows, 1,
+                                 weights->int8_scales[matrix],
+                                 error, error_size))
+                return 0;
+        }
+        return 1;
+    }
     READ_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
     READ_2D(query, "self_attn.q_proj.weight", TEXT_QUERY_DIM, TEXT_HIDDEN);
     READ_2D(key, "self_attn.k_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
@@ -406,7 +561,38 @@ static int gpu_operation(h3_gpu *gpu, int ok, char *error, size_t error_size,
     return 0;
 }
 
+/* One projection. BF16 checkpoint: the plain BF16 linear. INT8 checkpoint:
+ * rotate the input into the weights' basis, then either quantize it per row
+ * and run the INT8 TensorOps GEMM (W8A8) or dequantize the weight and run the
+ * BF16 linear (W8A16). */
+static int text_linear(h3_gpu *gpu, const text_layer_weights *weight,
+                       const text_int8_scratch *scratch, int matrix,
+                       h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *bf16_weight, uint32_t tokens) {
+    uint32_t rows = text_matrices[matrix].rows;
+    uint32_t columns = text_matrices[matrix].columns;
+    if (!scratch)
+        return h3_gpu_linear_bf16(gpu, output, input, bf16_weight, NULL,
+                                  tokens, columns, rows);
+    if (!h3_gpu_rotate256_bf16(gpu, scratch->rotated, input, tokens, columns))
+        return 0;
+    if (scratch->w8a16 & (1u << matrix)) {
+        return h3_gpu_dequantize_int8_rows_bf16(
+                   gpu, scratch->dequantized, weight->int8[matrix],
+                   weight->int8_scales[matrix], rows, columns) &&
+               h3_gpu_linear_bf16(gpu, output, scratch->rotated,
+                                  scratch->dequantized, NULL, tokens,
+                                  columns, rows);
+    }
+    return h3_gpu_linear_int8_bf16(gpu, output, scratch->quantized,
+                                   scratch->quantized_scales,
+                                   scratch->rotated, weight->int8[matrix],
+                                   weight->int8_scales[matrix], tokens,
+                                   columns, rows, 0);
+}
+
 static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
+                        const text_int8_scratch *scratch,
                         uint32_t tokens, h3_gpu_tensor *hidden,
                         h3_gpu_tensor *norm, h3_gpu_tensor *query,
                         h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -422,12 +608,12 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->input_norm,
                              tokens, TEXT_HIDDEN, TEXT_RMS_EPSILON),
        "input RMSNorm");
-    OP(h3_gpu_linear_bf16(gpu, query, norm, weight->query, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_QUERY_DIM), "query projection");
-    OP(h3_gpu_linear_bf16(gpu, key, norm, weight->key, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_KV_DIM), "key projection");
-    OP(h3_gpu_linear_bf16(gpu, value, norm, weight->value, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_KV_DIM), "value projection");
+    OP(text_linear(gpu, weight, scratch, TEXT_Q, query, norm, weight->query,
+                   tokens), "query projection");
+    OP(text_linear(gpu, weight, scratch, TEXT_K, key, norm, weight->key,
+                   tokens), "key projection");
+    OP(text_linear(gpu, weight, scratch, TEXT_V, value, norm, weight->value,
+                   tokens), "value projection");
     OP(h3_gpu_head_rms_norm_bf16(gpu, query, weight->query_norm, tokens,
                                   TEXT_QUERY_HEADS, TEXT_HEAD_DIM,
                                   TEXT_RMS_EPSILON), "query RMSNorm");
@@ -441,23 +627,22 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
                                TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM,
                                1.0f / sqrtf((float)TEXT_HEAD_DIM)),
        "causal GQA");
-    OP(h3_gpu_linear_bf16(gpu, attention_output, attention_heads,
-                           weight->attention_output, NULL, tokens,
-                           TEXT_QUERY_DIM, TEXT_HIDDEN),
+    OP(text_linear(gpu, weight, scratch, TEXT_O, attention_output,
+                   attention_heads, weight->attention_output, tokens),
        "attention output projection");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, attention_output,
                         tokens * TEXT_HIDDEN), "attention residual");
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->post_norm, tokens,
                              TEXT_HIDDEN, TEXT_RMS_EPSILON),
        "post-attention RMSNorm");
-    OP(h3_gpu_linear_bf16(gpu, gate, norm, weight->gate, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP gate");
-    OP(h3_gpu_linear_bf16(gpu, up, norm, weight->up, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP up");
+    OP(text_linear(gpu, weight, scratch, TEXT_GATE, gate, norm, weight->gate,
+                   tokens), "MLP gate");
+    OP(text_linear(gpu, weight, scratch, TEXT_UP, up, norm, weight->up,
+                   tokens), "MLP up");
     OP(h3_gpu_silu_mul_bf16(gpu, gate, gate, up,
                              tokens * TEXT_INTERMEDIATE), "fused SwiGLU");
-    OP(h3_gpu_linear_bf16(gpu, mlp_output, gate, weight->down, NULL, tokens,
-                           TEXT_INTERMEDIATE, TEXT_HIDDEN), "MLP down");
+    OP(text_linear(gpu, weight, scratch, TEXT_DOWN, mlp_output, gate,
+                   weight->down, tokens), "MLP down");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, mlp_output,
                         tokens * TEXT_HIDDEN), "MLP residual");
 #undef OP
@@ -545,6 +730,7 @@ static int text_encode_bf16_impl(
     }
     h3_gpu_profile_set_label(gpu, "Qwen text encoder");
     load_context load = {store, gpu, {NULL}, 0, error, error_size};
+    text_int8_scratch int8_scratch = {NULL, NULL, NULL, NULL, 0};
     uint32_t tokens = (uint32_t)token_count;
     size_t hidden_count = token_count * TEXT_HIDDEN;
     size_t query_count = token_count * TEXT_QUERY_DIM;
@@ -641,6 +827,26 @@ static int text_encode_bf16_impl(
         goto cleanup;
     }
 
+    const text_int8_scratch *scratch = NULL;
+    if (store_is_int8(store)) {
+        size_t padded = (token_count + 127u) & ~(size_t)127u;
+        int8_scratch.rotated = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
+        int8_scratch.quantized = h3_gpu_tensor_new_i8(
+            gpu, padded * TEXT_INTERMEDIATE);
+        int8_scratch.quantized_scales = h3_gpu_tensor_new_f32(gpu, padded);
+        int8_scratch.w8a16 = text_w8a16_mask();
+        if (int8_scratch.w8a16)
+            int8_scratch.dequantized = h3_gpu_tensor_new_bf16(
+                gpu, (size_t)TEXT_INTERMEDIATE * TEXT_HIDDEN);
+        if (!int8_scratch.rotated || !int8_scratch.quantized ||
+            !int8_scratch.quantized_scales ||
+            (int8_scratch.w8a16 && !int8_scratch.dequantized)) {
+            fail(error, error_size, "cannot allocate Qwen INT8 scratch: %s",
+                 h3_gpu_error(gpu));
+            goto cleanup;
+        }
+        scratch = &int8_scratch;
+    }
     h3_gpu_tensor *embedding_weight = load_2d(
         &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
         TEXT_HIDDEN);
@@ -690,7 +896,8 @@ static int text_encode_bf16_impl(
         int layer_ok =
             gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
                           "layer stream begin", layer) &&
-            encode_layer(gpu, &weights, tokens, hidden, norm, query, key,
+            encode_layer(gpu, &weights, scratch, tokens, hidden, norm, query,
+                         key,
                          value, attention_heads, attention_output, gate, up,
                          mlp_output, rope_cos, rope_sin, layer,
                          error, error_size) &&
@@ -773,6 +980,10 @@ cleanup:
     ok = 0;
 finished:
     retire_deferred(&load);
+    h3_gpu_tensor_free(int8_scratch.rotated);
+    h3_gpu_tensor_free(int8_scratch.quantized);
+    h3_gpu_tensor_free(int8_scratch.quantized_scales);
+    h3_gpu_tensor_free(int8_scratch.dequantized);
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
         h3_gpu_tensor_free(activations[index]);
