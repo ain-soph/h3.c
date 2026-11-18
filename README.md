@@ -6,6 +6,7 @@
 > | Zero-copy INT8 DiT (`tools/align_int8_pack.py`) | map weights instead of copying them | default on M5 when page-aligned (`H3_ZERO_COPY_WEIGHTS`) | DiT load 2.29 → 0.33 s; byte-identical |
 > | Per-block DiT Metal buffers | Metal wires a buffer as long as it lives | `H3_DIT_STREAM_WEIGHTS` (default on) | 768p wired 21.9 → 14.3 GB; same speed; byte-identical |
 > | BF16 video VAE (TensorOps) | FP32 VAE decode is slow | `H3_VAE_BF16=2` (off; `1` = linears only) | 768p VAE 79.0 → 33.6 s; PSNR 51.7 dB (linear-only variant) |
+> | BF16-stored VAE decoder matrices (`tools/vae_bf16.py`) | `H3_VAE_BF16` rounds them to BF16 at load anyway | loader accepts either; F32 path widens | video VAE 10.4 → 5.6 GB; byte-identical MP4; 512² VAE 2.75 → 2.09 s |
 > | VAE linear tiles 128×64 | 46–62 TFLOPS with 128×128 | always | 768p VAE 33.6 → 25.0 s; byte-identical |
 > | NAX attention, block-sparse attention, token reduction | approximate fast preset | `H3_ATTN=nax`, `H3_SPARSE=...`, `H3_TOKEN_REDUCTION` (off) | 768p 5 s fast 412 → 170 s; approximate, composition may change |
 > | Threadgroup race fixes (causal GQA softmax, VAE group norm) | long prompts and conditioned renders were irreproducible | always | same request → same MP4; speed unchanged |
