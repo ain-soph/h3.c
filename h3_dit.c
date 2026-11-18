@@ -98,11 +98,15 @@ struct h3_dit {
     /* Loaded from a packed checkpoint: INT8 block matrices and AdaLN rows,
      * no BF16 copies to fall back to. */
     int packed;
-    /* H3_DIT_STREAM_WEIGHTS=1 with a zero-copy packed DiT: each block's INT8
-     * matrices get a Metal buffer only while that block is encoded; the
-     * command buffer holds it until the GPU is done, then Metal can unwire the
-     * pages. Commands are committed every stream_map_blocks blocks and the CPU
-     * runs at most stream_map_inflight command buffers ahead of the GPU. */
+    /* Zero-copy packed DiT (default; H3_DIT_STREAM_WEIGHTS=0 keeps every
+     * block's buffers alive): each block's INT8 matrices get a Metal buffer
+     * only while that block is encoded; the command buffer holds it until the
+     * GPU is done, then Metal unwires the pages (Metal keeps a buffer's pages
+     * wired while the buffer lives, not only while a command uses it).
+     * Commands are committed every stream_map_blocks blocks and the CPU runs
+     * at most stream_map_inflight command buffers ahead of the GPU.
+     * 1344x768 124f: denoise 326.0 -> 325.4 s, wired peak 21.9 -> 13.7 GB,
+     * byte-identical output. */
     int stream_mapped;
     unsigned stream_map_blocks;
     unsigned stream_map_inflight;
@@ -1397,6 +1401,18 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !load_block_packed(dit, &dit->blocks[index], prefix,
                                    error, error_size)) return 0;
+            if (dit->stream_mapped &&
+                !h3_gpu_tensor_is_mapped(dit->blocks[index].qkv_int8)) {
+                /* Copied weights (not M5, or an unaligned pack): nothing to
+                 * unwire, so keep the resident command chain. */
+                dit->stream_mapped = 0;
+                for (unsigned done = 0; done < index; done++)
+                    if (!attach_block_weights(dit, &dit->blocks[done])) {
+                        fail(error, error_size, "cannot map DiT block %u: %s",
+                             done, h3_gpu_error(dit->gpu));
+                        return 0;
+                    }
+            }
             if (dit->stream_mapped) detach_block_weights(&dit->blocks[index]);
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
@@ -1890,8 +1906,10 @@ static h3_dit *load_dit(const char *weight_directory,
     {
         const char *stream_weights = getenv("H3_DIT_STREAM_WEIGHTS");
         dit->stream_mapped = dit->packed && !dit->ssd_streaming &&
-            stream_weights && !strcmp(stream_weights, "1");
-        dit->stream_map_blocks = env_unsigned("H3_DIT_STREAM_BLOCKS", 1,
+            !(stream_weights && !strcmp(stream_weights, "0"));
+        /* One block per command buffer costs ~6% of the 512x512 denoise;
+         * two is within noise and still unwires all but a few blocks. */
+        dit->stream_map_blocks = env_unsigned("H3_DIT_STREAM_BLOCKS", 2,
                                               H3_DIT_BLOCKS);
         dit->stream_map_inflight = env_unsigned("H3_DIT_STREAM_INFLIGHT", 2,
                                                 H3_DIT_BLOCKS);
