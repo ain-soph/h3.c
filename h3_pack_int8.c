@@ -16,8 +16,10 @@
  * --rot LIST (h3_rot.h: qkv,fc1,out256,out128,fc2) quantizes those classes
  * after the Hadamard rotation with the CPU quantizer the resident loader runs
  * for H3_DIT_ROT, and records them in the marker ("format":
- * "h3-int8-pack-v2", "rot": "LIST"); the DiT then rotates the matching
- * activations. A v1 marker (no "rot") means no rotation.
+ * "h3-int8-pack-v2", "rot": "LIST") and in every file's __metadata__
+ * ("h3": "int8-pack-v2", "h3_rot": "LIST"); the DiT checks that both agree and
+ * then rotates the matching activations. A v1 marker (no "rot") means no
+ * rotation. --table-only keeps the existing pack's rotation.
  *
  * Regime R holds every distinct timestep of the serving schedules with
  * 2..--max-steps evaluations (with and without each condition) whose row count
@@ -71,12 +73,20 @@ static int die(const char *format, ...) {
     return 0;
 }
 
+/* The identity every written file carries in __metadata__ (h3_rot.h,
+ * h3_rot_check_pack): "h3":"int8-pack-v1", or "int8-pack-v2" plus "h3_rot"
+ * for a rotated pack. Set once in main before anything is written. */
+static char pack_identity[160] = "\"h3\":\"int8-pack-v1\"";
+
 /* Declare every tensor first, then append their payloads in order. The file
  * is written under a temporary name and renamed when complete. */
 static int writer_open(writer *out, const char *directory, const char *name,
                        entry *entries, size_t count) {
     memset(out, 0, sizeof(*out));
-    snprintf(out->path, sizeof(out->path), "%s/%s", directory, name);
+    int written = snprintf(out->path, sizeof(out->path), "%s/%s", directory,
+                           name);
+    if (written < 0 || (size_t)written >= sizeof(out->path))
+        return die("path too long: %s/%s", directory, name);
     snprintf(out->temporary, sizeof(out->temporary), "%s.tmp", out->path);
     out->entries = entries;
     out->count = count;
@@ -84,7 +94,7 @@ static int writer_open(writer *out, const char *directory, const char *name,
     char *json = malloc(capacity);
     if (!json) return die("out of memory");
     size_t length = (size_t)snprintf(json, capacity,
-        "{\"__metadata__\":{\"format\":\"pt\",\"h3\":\"int8-pack-v1\"}");
+        "{\"__metadata__\":{\"format\":\"pt\",%s}", pack_identity);
     uint64_t offset = 0;
     for (size_t index = 0; index < count; index++) {
         const entry *item = &entries[index];
@@ -168,8 +178,11 @@ static int open_shards(const char *directory, shards *out) {
     out->count = count;
     for (size_t index = 0; index < count; index++) {
         char path[1024], error[512];
-        snprintf(path, sizeof(path), "%s/%s", directory, names[index]);
+        int written = snprintf(path, sizeof(path), "%s/%s", directory,
+                               names[index]);
         free(names[index]);
+        if (written < 0 || (size_t)written >= sizeof(path))
+            return die("path too long in %s", directory);
         if (!h3_st_read_header(path, &out->headers[index], error,
                                sizeof(error)))
             return die("%s", error);
@@ -526,6 +539,49 @@ static int verify(const char *source, const char *destination, h3_gpu *gpu,
 
 /* ---- main -------------------------------------------------------------- */
 
+static void json_string(FILE *file, const char *text) {
+    fputc('"', file);
+    for (const unsigned char *at = (const unsigned char *)text; *at; at++) {
+        if (*at == '"' || *at == '\\') fprintf(file, "\\%c", *at);
+        else if (*at == '\n') fputs("\\n", file);
+        else if (*at == '\t') fputs("\\t", file);
+        else if (*at < 0x20) fprintf(file, "\\u%04x", *at);
+        else fputc(*at, file);
+    }
+    fputc('"', file);
+}
+
+/* Written last, to a temporary file renamed into place. */
+static int write_marker(const char *marker, const char *source, int max_steps,
+                        uint32_t rows, int verified, unsigned rot_mask) {
+    char temporary[1100];
+    int written = snprintf(temporary, sizeof(temporary), "%s.tmp", marker);
+    if (written < 0 || (size_t)written >= sizeof(temporary))
+        return die("path too long: %s", marker);
+    FILE *file = fopen(temporary, "w");
+    if (!file) return die("cannot write %s", temporary);
+    fprintf(file, "{\"format\": \"%s\", \"source\": ",
+            rot_mask ? "h3-int8-pack-v2" : "h3-int8-pack-v1");
+    json_string(file, source);
+    fprintf(file, ", \"max_steps\": %d, \"adaln_rows\": %u, "
+                  "\"verified\": %s", max_steps, rows,
+            verified ? "true" : "false");
+    if (rot_mask) {
+        char list[96];
+        h3_rot_format(rot_mask, list, sizeof(list));
+        fprintf(file, ", \"rot\": \"%s\", \"rotation\": "
+                      "\"H256=(H4/2)^4, H128=(H2/sqrt2)(H4/2)^3\"", list);
+    }
+    fprintf(file, ", \"packed_at\": %ld}\n", (long)time(NULL));
+    int ok = !ferror(file);
+    if (fclose(file) != 0) ok = 0;
+    if (!ok || rename(temporary, marker) != 0) {
+        remove(temporary);
+        return die("cannot write %s", marker);
+    }
+    return 1;
+}
+
 static int copy_file(const char *from, const char *to) {
     FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
     if (!out) {
@@ -546,11 +602,13 @@ int main(int argc, char **argv) {
     const char *source = NULL, *destination = NULL;
     int max_steps = 20, verify_only = 0, run_verify = 0, table_only = 0;
     unsigned rot_mask = 0;
+    int rot_given = 0;
     char rot_error[256] = "";
     for (int index = 1; index < argc; index++) {
         if (!strcmp(argv[index], "--max-steps") && index + 1 < argc)
             max_steps = atoi(argv[++index]);
         else if (!strcmp(argv[index], "--rot") && index + 1 < argc) {
+            rot_given = 1;
             if (!h3_rot_parse(argv[++index], &rot_mask, rot_error,
                               sizeof(rot_error))) {
                 fprintf(stderr, "h3_pack_int8: --rot: %s\n", rot_error);
@@ -581,18 +639,45 @@ int main(int argc, char **argv) {
         return same ? 0 : 1;
     }
     char marker[1024];
-    snprintf(marker, sizeof(marker), "%s/h3-int8-pack.json", destination);
-    remove(marker);
+    int marker_length = snprintf(marker, sizeof(marker), "%s/h3-int8-pack.json",
+                                 destination);
+    if (marker_length < 0 || (size_t)marker_length >= sizeof(marker))
+        return die("path too long: %s", destination) ? 0 : 1;
+    if (table_only) {
+        /* The blocks stay as they are, so the rotation must too: take it from
+         * the existing pack (marker and weight files must agree) before
+         * touching anything. A --rot that restates it is accepted. */
+        unsigned existing = 0;
+        if (!h3_rot_read_marker(marker, &existing, error, sizeof(error)) ||
+            !h3_rot_check_pack(destination, existing, error, sizeof(error)))
+            return die("--table-only needs a complete pack: %s", error) ? 0 : 1;
+        if (rot_given && rot_mask != existing) {
+            char have[96], want[96];
+            h3_rot_format(existing, have, sizeof(have));
+            h3_rot_format(rot_mask, want, sizeof(want));
+            fprintf(stderr, "h3_pack_int8: --table-only keeps the pack's "
+                            "rotation (%s); --rot %s needs a full pack\n",
+                    have, want);
+            return 2;
+        }
+        rot_mask = existing;
+    }
+    if (rot_mask) {
+        char list[96];
+        h3_rot_format(rot_mask, list, sizeof(list));
+        snprintf(pack_identity, sizeof(pack_identity),
+                 "\"h3\":\"int8-pack-v2\",\"h3_rot\":\"%s\"", list);
+    }
+    /* No marker while the pack is being written: a partial pack is never
+     * loaded. */
+    if (remove(marker) != 0 && errno != ENOENT)
+        return die("cannot remove %s: %s", marker, strerror(errno)) ? 0 : 1;
     if (mkdir(destination, 0755) != 0 && errno != EEXIST)
         return die("cannot create %s: %s", destination, strerror(errno)) ? 0 : 1;
     shards source_shards = {0};
     h3_weight_store *store = h3_weight_store_open(source, error, sizeof(error));
     if (!store) return die("%s", error) ? 0 : 1;
     time_t started = time(NULL);
-    if (table_only && rot_mask) {
-        fprintf(stderr, "h3_pack_int8: --rot needs a full pack\n");
-        return 2;
-    }
     if (!table_only) {
         if (!open_shards(source, &source_shards) ||
             !copy_base(&source_shards, destination)) return 1;
@@ -608,30 +693,18 @@ int main(int argc, char **argv) {
     if (!pack_table(store, gpu, max_steps, destination, &rows)) return 1;
     h3_weight_store_free(store);
     char from[1024], to[1024];
-    snprintf(from, sizeof(from), "%s/config.json", source);
-    snprintf(to, sizeof(to), "%s/config.json", destination);
+    int from_length = snprintf(from, sizeof(from), "%s/config.json", source);
+    int to_length = snprintf(to, sizeof(to), "%s/config.json", destination);
+    if (from_length < 0 || (size_t)from_length >= sizeof(from) ||
+        to_length < 0 || (size_t)to_length >= sizeof(to))
+        return die("path too long") ? 0 : 1;
     if (!copy_file(from, to)) return 1;
     if (run_verify && !verify(source, destination, gpu, max_steps)) {
         h3_gpu_free(gpu);
         return die("verification failed; marker not written") ? 0 : 1;
     }
-    FILE *file = fopen(marker, "w");
-    if (!file) return die("cannot write %s", marker) ? 0 : 1;
-    if (rot_mask) {
-        char list[96];
-        h3_rot_format(rot_mask, list, sizeof(list));
-        fprintf(file, "{\"format\": \"h3-int8-pack-v2\", \"source\": "
-                      "\"%s\", \"max_steps\": %d, \"adaln_rows\": %u, "
-                      "\"verified\": %s, \"rot\": \"%s\", "
-                      "\"rotation\": \"H256=(H4/2)^4, H128=(H2/sqrt2)(H4/2)^3\", "
-                      "\"packed_at\": %ld}\n", source, max_steps, rows,
-                run_verify ? "true" : "false", list, (long)time(NULL));
-    } else
-    fprintf(file, "{\"format\": \"h3-int8-pack-v1\", \"source\": \"%s\", "
-                  "\"max_steps\": %d, \"adaln_rows\": %u, \"verified\": %s, "
-                  "\"packed_at\": %ld}\n", source, max_steps, rows,
-            run_verify ? "true" : "false", (long)time(NULL));
-    fclose(file);
+    if (!write_marker(marker, source, max_steps, rows, run_verify, rot_mask))
+        return 1;
     h3_gpu_free(gpu);
     fprintf(stderr, "packed %s -> %s in %lds (%u AdaLN rows)\n", source,
             destination, (long)(time(NULL) - started), rows);

@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 enum {
     H3_ROT_QKV = 1u,
@@ -47,10 +48,20 @@ int h3_rot_parse(const char *text, unsigned *mask, char *error,
                  size_t error_size);
 /* Canonical comma list ("none" for 0). */
 void h3_rot_format(unsigned mask, char *text, size_t size);
-/* Mask of the "rot" field of an h3-int8-pack.json marker (v1 markers have
- * none: 0). Returns 0 when the file is unreadable or the field is invalid. */
+/* Mask of an h3-int8-pack.json marker: "format" "h3-int8-pack-v1" (no
+ * "rot": 0) or "h3-int8-pack-v2" with a non-empty "rot" list. Strict: an
+ * unknown format, a v2 marker without "rot", a v1 marker with one or a
+ * malformed file is an error (returns 0 and fills error). */
 int h3_rot_read_marker(const char *marker_path, unsigned *mask, char *error,
                        size_t error_size);
+/* Every *.safetensors file of a packed DiT carries its own identity in
+ * __metadata__ ("h3": "int8-pack-v1", or "int8-pack-v2" + "h3_rot": LIST,
+ * written by h3_pack_int8 or tools/stamp_int8_pack_rot.py). Returns 0 and
+ * fills error unless every file agrees with the marker's mask, so weights
+ * quantized with one rotation are never run with another (a lost, rewritten
+ * or copied marker, a half re-packed directory). */
+int h3_rot_check_pack(const char *directory, unsigned marker_mask,
+                      char *error, size_t error_size);
 
 /* True when the matrix needs the CPU rotated quantizer under this mask. */
 int h3_rot_matrix_rotated(h3_rot_matrix matrix, unsigned mask);
@@ -67,5 +78,11 @@ int h3_rot_quantize_matrix(h3_rot_matrix matrix, unsigned mask,
                            const uint16_t *weight, uint32_t rows,
                            uint32_t columns, int8_t *quantized,
                            float *scales);
+
+/* Output file of a Track A study hook (H3_TEXT_EMB_OUT, H3_DUMP_*,
+ * H3_TEACHER_FORCE_DUMP/LOG): a regular file only, never through a symlink
+ * (O_NOFOLLOW), created 0644, truncated or (append) appended to. NULL on
+ * failure. A caller that fails a write removes the file. */
+FILE *h3_study_fopen(const char *path, int append);
 
 #endif

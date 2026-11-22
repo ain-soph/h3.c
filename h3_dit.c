@@ -1849,17 +1849,24 @@ static int check_packed_options(const h3_dit *dit, int use_slower_bf16_mlp,
 }
 
 /* Rotation classes: a packed DiT carries them in h3-int8-pack.json ("rot",
- * format h3-int8-pack-v2); H3_DIT_ROT may only restate them. BF16 weights
- * quantized on load take H3_DIT_ROT (default none). Pure BF16 (SSD streaming
- * of the BF16 checkpoint or --use-slower-bf16-*) has no int8 to rotate. */
+ * format h3-int8-pack-v2) and in every weight file's __metadata__, which must
+ * agree (h3_rot_check_pack); H3_DIT_ROT may only restate them. BF16 weights
+ * quantized on load take H3_DIT_ROT (default none). Runs after the int8
+ * flags are known: a rotation needs every block matrix on its int8 path
+ * (a BF16 fallback of one class would pair rotated and unrotated halves,
+ * e.g. out128), so anything that would leave one in BF16 is refused. */
 static int configure_rotation(h3_dit *dit, const char *weight_directory,
-                              int use_slower_bf16_mlp,
-                              int use_slower_bf16_qkv,
-                              int use_slower_bf16_attention_output,
                               char *error, size_t error_size) {
+    static const char *const bf16_env[] = {
+        "H3_DISABLE_FUSED_MLP", "H3_DISABLE_INT8_MLP", "H3_INT8_MLP_STAGE",
+        "H3_DISABLE_INT8_QKV", "H3_DISABLE_INT8_ATTENTION_OUT",
+        "H3_INT8_KEEP_BF16_MLP", "H3_INT8_KEEP_BF16_QKV",
+        "H3_INT8_KEEP_BF16_ATTENTION_OUT", "H3_BENCH_INT8_MLP_AB",
+        "H3_BENCH_INT8_QKV_AB", "H3_BENCH_INT8_ATTENTION_OUT_AB"
+    };
     const char *requested = getenv("H3_DIT_ROT");
     unsigned env_mask = 0;
-    char detail[256] = "";
+    char detail[1024] = "";
     if (requested && !h3_rot_parse(requested, &env_mask, detail,
                                    sizeof(detail))) {
         fail(error, error_size, "H3_DIT_ROT: %s", detail);
@@ -1867,10 +1874,16 @@ static int configure_rotation(h3_dit *dit, const char *weight_directory,
     }
     if (dit->packed) {
         char marker[1200];
-        snprintf(marker, sizeof(marker), "%s/h3-int8-pack.json",
-                 weight_directory);
+        int written = snprintf(marker, sizeof(marker), "%s/h3-int8-pack.json",
+                               weight_directory);
+        if (written < 0 || (size_t)written >= sizeof(marker)) {
+            fail(error, error_size, "DiT directory path too long");
+            return 0;
+        }
         if (!h3_rot_read_marker(marker, &dit->rot_mask, detail,
-                                sizeof(detail))) {
+                                sizeof(detail)) ||
+            !h3_rot_check_pack(weight_directory, dit->rot_mask, detail,
+                               sizeof(detail))) {
             fail(error, error_size, "%s", detail);
             return 0;
         }
@@ -1884,24 +1897,30 @@ static int configure_rotation(h3_dit *dit, const char *weight_directory,
         }
     } else {
         dit->rot_mask = env_mask;
-        if (env_mask && (dit->ssd_streaming || use_slower_bf16_mlp ||
-                         use_slower_bf16_qkv ||
-                         use_slower_bf16_attention_output)) {
-            fail(error, error_size, "H3_DIT_ROT needs every DiT block matrix "
-                 "in int8 (no --ssd-streaming or --use-slower-bf16-*)");
+    }
+    if (!dit->rot_mask) return 1;
+    if (!dit->int8_qkv || !dit->int8_attention_out || !dit->int8_mlp) {
+        fail(error, error_size, "the Hadamard-rotated DiT needs every block "
+             "matrix in int8 (no --ssd-streaming of BF16 weights, "
+             "--use-slower-bf16-*, prompts under 128 tokens or GPUs without "
+             "int8 TensorOps)");
+        return 0;
+    }
+    for (size_t index = 0; index < sizeof(bf16_env) / sizeof(*bf16_env);
+         index++) {
+        if (getenv(bf16_env[index])) {
+            fail(error, error_size, "%s is not rotation-aware (it keeps or "
+                 "runs BF16 block matrices)", bf16_env[index]);
             return 0;
         }
     }
-    if (dit->rot_mask && getenv("H3_INT8_FC1_LOCAL") &&
-        (dit->rot_mask & H3_ROT_FC1)) {
+    if (getenv("H3_INT8_FC1_LOCAL") && (dit->rot_mask & H3_ROT_FC1)) {
         fail(error, error_size, "H3_INT8_FC1_LOCAL is not rotation-aware");
         return 0;
     }
-    if (dit->rot_mask) {
-        char list[96];
-        h3_rot_format(dit->rot_mask, list, sizeof(list));
-        fprintf(stderr, "h3: DiT int8 Hadamard rotation: %s\n", list);
-    }
+    char list[96];
+    h3_rot_format(dit->rot_mask, list, sizeof(list));
+    fprintf(stderr, "h3: DiT int8 Hadamard rotation: %s\n", list);
     return 1;
 }
 
@@ -2020,10 +2039,6 @@ static h3_dit *load_dit(const char *weight_directory,
             dit, use_slower_bf16_mlp, use_slower_bf16_qkv,
             use_slower_bf16_attention_output, error, error_size))
         goto failed;
-    if (!configure_rotation(dit, weight_directory, use_slower_bf16_mlp,
-                            use_slower_bf16_qkv,
-                            use_slower_bf16_attention_output,
-                            error, error_size)) goto failed;
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
@@ -2054,6 +2069,8 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+    if (!configure_rotation(dit, weight_directory, error, error_size))
+        goto failed;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -3063,11 +3080,13 @@ static int tf_file(const char *directory, int step, const char *suffix,
 
 static int tf_write(const char *path, const void *first, size_t first_bytes,
                     const void *second, size_t second_bytes) {
-    FILE *file = fopen(path, "wb");
+    FILE *file = h3_study_fopen(path, 0);
     if (!file) return 0;
     int ok = fwrite(first, 1, first_bytes, file) == first_bytes &&
              fwrite(second, 1, second_bytes, file) == second_bytes;
-    return fclose(file) == 0 && ok;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) remove(path);
+    return ok;
 }
 
 static int tf_read(const char *path, void *data, size_t bytes) {
@@ -3181,7 +3200,8 @@ static int teacher_force(h3_dit *dit, const char *directory,
                                 sizeof(*expected));
     uint16_t *actual = malloc((video_count + audio_count) * sizeof(*actual));
     const char *log_path = getenv("H3_TEACHER_FORCE_LOG");
-    FILE *log = log_path ? fopen(log_path, "a") : NULL;
+    if (log_path && !*log_path) log_path = NULL;
+    FILE *log = log_path ? h3_study_fopen(log_path, 1) : NULL;
     int ok = input && expected && actual && (!log_path || log);
     if (!ok) fail(error, error_size, "cannot start teacher forcing");
     double sum_video = 0.0, sum_audio = 0.0, sum_ms = 0.0;
@@ -3210,11 +3230,13 @@ static int teacher_force(h3_dit *dit, const char *directory,
             break;
         }
         double started = tf_now();
-        ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
-                    "begin teacher-forced forward") &&
+        int began = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                           "begin teacher-forced forward");
+        ok = began &&
              encode_forward(dit, step, 0, 0, 1, error, error_size) &&
              gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                     "submit teacher-forced forward");
+        if (began && !ok) h3_gpu_abort(dit->gpu);   /* drain before teardown */
         double milliseconds = 1e3 * (tf_now() - started);
         ok = ok && h3_gpu_tensor_read_bf16(dit->video_output_bf16, actual,
                                            video_count) &&
@@ -3544,7 +3566,9 @@ int h3_dit_denoise_euler_preview(
         return 0;
     }
     if (!gpu_sampler_requested(dit) &&
-        (getenv("H3_TEACHER_FORCE_DIR") || getenv("H3_TEACHER_FORCE_DUMP"))) {
+        ((getenv("H3_TEACHER_FORCE_DIR") && *getenv("H3_TEACHER_FORCE_DIR")) ||
+         (getenv("H3_TEACHER_FORCE_DUMP") &&
+          *getenv("H3_TEACHER_FORCE_DUMP")))) {
         fail(error, error_size, "teacher forcing needs the GPU sampler");
         return 0;
     }
