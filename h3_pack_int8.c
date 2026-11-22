@@ -13,6 +13,12 @@
  *                            [T, 96768] and adaln_table.rR.final BF16 [T, 10752]
  *   config.json, h3-int8-pack.json (marker, written last)
  *
+ * --rot LIST (h3_rot.h: qkv,fc1,out256,out128,fc2) quantizes those classes
+ * after the Hadamard rotation with the CPU quantizer the resident loader runs
+ * for H3_DIT_ROT, and records them in the marker ("format":
+ * "h3-int8-pack-v2", "rot": "LIST"); the DiT then rotates the matching
+ * activations. A v1 marker (no "rot") means no rotation.
+ *
  * Regime R holds every distinct timestep of the serving schedules with
  * 2..--max-steps evaluations (with and without each condition) whose row count
  * falls in R. --verify then rebuilds the AdaLN tables of all those schedules
@@ -21,6 +27,7 @@
 #include "h3_dit_schedule.h"
 #include "h3_gpu.h"
 #include "h3_host.h"
+#include "h3_rot.h"
 #include "h3_safetensors.h"
 #include "h3_weights.h"
 
@@ -235,15 +242,17 @@ static const struct {
     const char *suffix;
     uint32_t rows;
     uint32_t columns;
+    h3_rot_matrix matrix;
 } matrices[] = {
-    {"attn.qkv_proj", INNER * 3, HIDDEN},
-    {"attn.out_proj", HIDDEN, INNER},
-    {"mlp.fc1", FFN * 2, HIDDEN},
-    {"mlp.fc2", HIDDEN, FFN},
+    {"attn.qkv_proj", INNER * 3, HIDDEN, H3_ROT_MATRIX_QKV},
+    {"attn.out_proj", HIDDEN, INNER, H3_ROT_MATRIX_OUT},
+    {"mlp.fc1", FFN * 2, HIDDEN, H3_ROT_MATRIX_FC1},
+    {"mlp.fc2", HIDDEN, FFN, H3_ROT_MATRIX_FC2},
 };
 
 static int pack_block(const h3_weight_store *store, h3_gpu *gpu,
-                      unsigned block, const char *destination) {
+                      unsigned block, const char *destination,
+                      unsigned rot_mask) {
     entry entries[8];
     for (unsigned index = 0; index < 4; index++) {
         entry *weight = &entries[2 * index];
@@ -281,13 +290,23 @@ static int pack_block(const h3_weight_store *store, h3_gpu *gpu,
         h3_gpu_tensor *scales = h3_gpu_tensor_new_f32(gpu, rows);
         int8_t *host_weight = malloc(elements);
         float *host_scales = malloc((size_t)rows * sizeof(float));
-        int ok = source && weight && scales && host_weight && host_scales &&
+        uint16_t *host_source = NULL;
+        int rotated = h3_rot_matrix_rotated(matrices[index].matrix, rot_mask);
+        if (rotated) host_source = malloc(elements * sizeof(*host_source));
+        int ok = rotated ?
+            source && host_weight && host_scales && host_source &&
+            h3_gpu_tensor_read_bf16(source, host_source, elements) &&
+            h3_rot_quantize_matrix(matrices[index].matrix, rot_mask,
+                                   host_source, rows, columns, host_weight,
+                                   host_scales) :
+            source && weight && scales && host_weight && host_scales &&
             h3_gpu_begin(gpu) &&
             h3_gpu_quantize_weight_int8(gpu, weight, scales, source, rows,
                                         columns) &&
             h3_gpu_submit(gpu) &&
             h3_gpu_tensor_read_i8(weight, host_weight, elements) &&
             h3_gpu_tensor_read_f32(scales, host_scales, rows);
+        free(host_source);
         h3_gpu_tensor_free(source);
         h3_gpu_tensor_free(weight);
         h3_gpu_tensor_free(scales);
@@ -526,9 +545,18 @@ static int copy_file(const char *from, const char *to) {
 int main(int argc, char **argv) {
     const char *source = NULL, *destination = NULL;
     int max_steps = 20, verify_only = 0, run_verify = 0, table_only = 0;
+    unsigned rot_mask = 0;
+    char rot_error[256] = "";
     for (int index = 1; index < argc; index++) {
         if (!strcmp(argv[index], "--max-steps") && index + 1 < argc)
             max_steps = atoi(argv[++index]);
+        else if (!strcmp(argv[index], "--rot") && index + 1 < argc) {
+            if (!h3_rot_parse(argv[++index], &rot_mask, rot_error,
+                              sizeof(rot_error))) {
+                fprintf(stderr, "h3_pack_int8: --rot: %s\n", rot_error);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[index], "--verify")) run_verify = 1;
         else if (!strcmp(argv[index], "--verify-only")) verify_only = 1;
         else if (!strcmp(argv[index], "--table-only")) table_only = 1;
@@ -538,7 +566,8 @@ int main(int argc, char **argv) {
     }
     if (!source || !destination || max_steps < 2 || max_steps > 100) {
         fprintf(stderr, "usage: h3_pack_int8 SRC/transformer DST/transformer-int8 "
-                        "[--max-steps N] [--table-only] [--verify | --verify-only]\n"
+                        "[--max-steps N] [--rot qkv,fc1,out256|out128,fc2] "
+                        "[--table-only] [--verify | --verify-only]\n"
                         "Run from the h3.c directory (it loads h3_shaders.metal).\n");
         return 2;
     }
@@ -560,11 +589,16 @@ int main(int argc, char **argv) {
     h3_weight_store *store = h3_weight_store_open(source, error, sizeof(error));
     if (!store) return die("%s", error) ? 0 : 1;
     time_t started = time(NULL);
+    if (table_only && rot_mask) {
+        fprintf(stderr, "h3_pack_int8: --rot needs a full pack\n");
+        return 2;
+    }
     if (!table_only) {
         if (!open_shards(source, &source_shards) ||
             !copy_base(&source_shards, destination)) return 1;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
-            if (!pack_block(store, gpu, block, destination)) return 1;
+            if (!pack_block(store, gpu, block, destination, rot_mask))
+                return 1;
             fprintf(stderr, "\rblocks: %u/%u (%lds)", block + 1,
                     H3_DIT_BLOCKS, (long)(time(NULL) - started));
         }
@@ -583,6 +617,16 @@ int main(int argc, char **argv) {
     }
     FILE *file = fopen(marker, "w");
     if (!file) return die("cannot write %s", marker) ? 0 : 1;
+    if (rot_mask) {
+        char list[96];
+        h3_rot_format(rot_mask, list, sizeof(list));
+        fprintf(file, "{\"format\": \"h3-int8-pack-v2\", \"source\": "
+                      "\"%s\", \"max_steps\": %d, \"adaln_rows\": %u, "
+                      "\"verified\": %s, \"rot\": \"%s\", "
+                      "\"rotation\": \"H256=(H4/2)^4, H128=(H2/sqrt2)(H4/2)^3\", "
+                      "\"packed_at\": %ld}\n", source, max_steps, rows,
+                run_verify ? "true" : "false", list, (long)time(NULL));
+    } else
     fprintf(file, "{\"format\": \"h3-int8-pack-v1\", \"source\": \"%s\", "
                   "\"max_steps\": %d, \"adaln_rows\": %u, \"verified\": %s, "
                   "\"packed_at\": %ld}\n", source, max_steps, rows,

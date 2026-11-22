@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_rot.h"
 #include "h3_sparse.h"
 #include "h3_weights.h"
 
@@ -94,6 +95,9 @@ struct h3_dit {
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
+    /* Hadamard-rotated W8A8 classes (h3_rot.h): from the pack marker's "rot"
+     * field, or H3_DIT_ROT when quantizing BF16 weights on load. */
+    unsigned rot_mask;
     int ssd_streaming;
     /* Loaded from a packed checkpoint: INT8 block matrices and AdaLN rows,
      * no BF16 copies to fall back to. */
@@ -832,6 +836,31 @@ static void *read_stream_layer_thread(void *opaque) {
     return NULL;
 }
 
+/* Rotated classes are quantized on the CPU (h3_rot_quantize_matrix), the
+ * same code h3_pack_int8 runs, so a rotated pack equals quantizing on load. */
+static int quantize_rotated(h3_dit *dit, h3_rot_matrix matrix,
+                            const h3_gpu_tensor *weight, uint32_t rows,
+                            uint32_t columns, h3_gpu_tensor *quantized,
+                            h3_gpu_tensor *scales, char *error,
+                            size_t error_size) {
+    size_t elements = (size_t)rows * columns;
+    uint16_t *host = malloc(elements * sizeof(*host));
+    int8_t *host_q = malloc(elements);
+    float *host_s = malloc((size_t)rows * sizeof(*host_s));
+    int ok = host && host_q && host_s &&
+        h3_gpu_tensor_read_bf16(weight, host, elements) &&
+        h3_rot_quantize_matrix(matrix, dit->rot_mask, host, rows, columns,
+                               host_q, host_s) &&
+        h3_gpu_tensor_write_i8(quantized, host_q, elements) &&
+        h3_gpu_tensor_write_f32(scales, host_s, rows);
+    free(host);
+    free(host_q);
+    free(host_s);
+    if (!ok) fail(error, error_size, "cannot quantize rotated DiT matrix %d",
+                  (int)matrix);
+    return ok;
+}
+
 static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
     block->fc1_int8 = h3_gpu_tensor_new_i8(
@@ -840,16 +869,24 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
     block->fc2_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)HIDDEN * FFN);
     block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    int rot_fc1 = h3_rot_matrix_rotated(H3_ROT_MATRIX_FC1, dit->rot_mask);
+    int rot_fc2 = h3_rot_matrix_rotated(H3_ROT_MATRIX_FC2, dit->rot_mask);
     int ok = block->fc1_int8 && block->fc1_scales &&
              block->fc2_int8 && block->fc2_scales &&
              h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
+             (rot_fc1 || h3_gpu_quantize_weight_int8(
                  dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
-                 FFN * 2, HIDDEN) &&
-             h3_gpu_quantize_weight_int8(
+                 FFN * 2, HIDDEN)) &&
+             (rot_fc2 || h3_gpu_quantize_weight_int8(
                  dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
-                 HIDDEN, FFN) &&
-             h3_gpu_submit(dit->gpu);
+                 HIDDEN, FFN)) &&
+             h3_gpu_submit(dit->gpu) &&
+             (!rot_fc1 || quantize_rotated(
+                 dit, H3_ROT_MATRIX_FC1, block->fc1, FFN * 2, HIDDEN,
+                 block->fc1_int8, block->fc1_scales, error, error_size)) &&
+             (!rot_fc2 || quantize_rotated(
+                 dit, H3_ROT_MATRIX_FC2, block->fc2, HIDDEN, FFN,
+                 block->fc2_int8, block->fc2_scales, error, error_size));
     if (!ok) {
         fail(error, error_size, "cannot quantize DiT MLP weights: %s",
              h3_gpu_error(dit->gpu));
@@ -868,11 +905,15 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
         dit->gpu, (size_t)INNER * 3 * HIDDEN);
     block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
     int ok = block->qkv_int8 && block->qkv_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
-                 INNER * 3, HIDDEN) &&
-             h3_gpu_submit(dit->gpu);
+             (h3_rot_matrix_rotated(H3_ROT_MATRIX_QKV, dit->rot_mask) ?
+              quantize_rotated(dit, H3_ROT_MATRIX_QKV, block->qkv, INNER * 3,
+                               HIDDEN, block->qkv_int8, block->qkv_scales,
+                               error, error_size) :
+              h3_gpu_begin(dit->gpu) &&
+              h3_gpu_quantize_weight_int8(
+                  dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
+                  INNER * 3, HIDDEN) &&
+              h3_gpu_submit(dit->gpu));
     if (!ok) {
         fail(error, error_size, "cannot quantize DiT QKV weight: %s",
              h3_gpu_error(dit->gpu));
@@ -888,11 +929,15 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
         dit->gpu, (size_t)HIDDEN * INNER);
     block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
     int ok = block->out_int8 && block->out_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->out_int8, block->out_scales, block->out,
-                 HIDDEN, INNER) &&
-             h3_gpu_submit(dit->gpu);
+             (h3_rot_matrix_rotated(H3_ROT_MATRIX_OUT, dit->rot_mask) ?
+              quantize_rotated(dit, H3_ROT_MATRIX_OUT, block->out, HIDDEN,
+                               INNER, block->out_int8, block->out_scales,
+                               error, error_size) :
+              h3_gpu_begin(dit->gpu) &&
+              h3_gpu_quantize_weight_int8(
+                  dit->gpu, block->out_int8, block->out_scales, block->out,
+                  HIDDEN, INNER) &&
+              h3_gpu_submit(dit->gpu));
     if (!ok) {
         fail(error, error_size,
              "cannot quantize DiT attention-output weight: %s",
@@ -1803,6 +1848,63 @@ static int check_packed_options(const h3_dit *dit, int use_slower_bf16_mlp,
     return 1;
 }
 
+/* Rotation classes: a packed DiT carries them in h3-int8-pack.json ("rot",
+ * format h3-int8-pack-v2); H3_DIT_ROT may only restate them. BF16 weights
+ * quantized on load take H3_DIT_ROT (default none). Pure BF16 (SSD streaming
+ * of the BF16 checkpoint or --use-slower-bf16-*) has no int8 to rotate. */
+static int configure_rotation(h3_dit *dit, const char *weight_directory,
+                              int use_slower_bf16_mlp,
+                              int use_slower_bf16_qkv,
+                              int use_slower_bf16_attention_output,
+                              char *error, size_t error_size) {
+    const char *requested = getenv("H3_DIT_ROT");
+    unsigned env_mask = 0;
+    char detail[256] = "";
+    if (requested && !h3_rot_parse(requested, &env_mask, detail,
+                                   sizeof(detail))) {
+        fail(error, error_size, "H3_DIT_ROT: %s", detail);
+        return 0;
+    }
+    if (dit->packed) {
+        char marker[1200];
+        snprintf(marker, sizeof(marker), "%s/h3-int8-pack.json",
+                 weight_directory);
+        if (!h3_rot_read_marker(marker, &dit->rot_mask, detail,
+                                sizeof(detail))) {
+            fail(error, error_size, "%s", detail);
+            return 0;
+        }
+        if (requested && env_mask != dit->rot_mask) {
+            char pack[96], wanted[96];
+            h3_rot_format(dit->rot_mask, pack, sizeof(pack));
+            h3_rot_format(env_mask, wanted, sizeof(wanted));
+            fail(error, error_size, "H3_DIT_ROT=%s does not match the packed "
+                 "DiT's rotation (%s)", wanted, pack);
+            return 0;
+        }
+    } else {
+        dit->rot_mask = env_mask;
+        if (env_mask && (dit->ssd_streaming || use_slower_bf16_mlp ||
+                         use_slower_bf16_qkv ||
+                         use_slower_bf16_attention_output)) {
+            fail(error, error_size, "H3_DIT_ROT needs every DiT block matrix "
+                 "in int8 (no --ssd-streaming or --use-slower-bf16-*)");
+            return 0;
+        }
+    }
+    if (dit->rot_mask && getenv("H3_INT8_FC1_LOCAL") &&
+        (dit->rot_mask & H3_ROT_FC1)) {
+        fail(error, error_size, "H3_INT8_FC1_LOCAL is not rotation-aware");
+        return 0;
+    }
+    if (dit->rot_mask) {
+        char list[96];
+        h3_rot_format(dit->rot_mask, list, sizeof(list));
+        fprintf(stderr, "h3: DiT int8 Hadamard rotation: %s\n", list);
+    }
+    return 1;
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -1918,6 +2020,10 @@ static h3_dit *load_dit(const char *weight_directory,
             dit, use_slower_bf16_mlp, use_slower_bf16_qkv,
             use_slower_bf16_attention_output, error, error_size))
         goto failed;
+    if (!configure_rotation(dit, weight_directory, use_slower_bf16_mlp,
+                            use_slower_bf16_qkv,
+                            use_slower_bf16_attention_output,
+                            error, error_size)) goto failed;
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
@@ -2198,7 +2304,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             attention_input_quantized,
             dit->use_slower_unfused_qkv_rope,
             dit->use_slower_scalar_qkv_rms,
-            dit->use_slower_uncached_int8_scales),
+            dit->use_slower_uncached_int8_scales,
+            (dit->rot_mask & H3_ROT_QKV) != 0),
            "DiT int8 QKV projection/norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
@@ -2237,13 +2344,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->attention_output, dit->int8_activation,
                 dit->int8_activation_scales, dit->attention_heads,
                 weight->out_int8, weight->out_scales, rows, HEADS, HEAD_DIM,
-                HIDDEN), "DiT head-major int8 attention output");
+                HIDDEN, (dit->rot_mask & H3_ROT_OUT256) != 0),
+               "DiT head-major int8 attention output");
         else
-            OP(h3_gpu_linear_int8_bf16(
+            OP(h3_gpu_linear_int8_bf16_rotated(
                 dit->gpu, dit->attention_output, dit->int8_activation,
                 dit->int8_activation_scales, dit->attention_heads,
                 weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
-                dit->use_slower_uncached_int8_scales),
+                dit->use_slower_uncached_int8_scales,
+                (dit->rot_mask & H3_ROT_OUT256) != 0),
                "DiT int8 attention output");
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
@@ -2260,7 +2369,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->hidden, dit->int8_activation,
             dit->int8_activation_scales, dit->hidden,
             dit->attention_output, weight->norm2, modulation, modulation,
-            row_map, rows, padded_rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
+            row_map, rows, padded_rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f,
+            (dit->rot_mask & H3_ROT_FC1) != 0),
            "DiT fused attention gate, MLP AdaLN and int8 quantization");
     } else if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_gate_adaln_bf16(
@@ -2292,7 +2402,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rows, HIDDEN, FFN, HIDDEN,
             dit->use_slower_grouped_quantizer,
             dit->use_slower_dynamic_fc1_k, dit->use_int8_row_fc2,
-            fused_int8_mlp_input),
+            fused_int8_mlp_input,
+            ((dit->rot_mask & H3_ROT_FC1) ? H3_GPU_ROTATE_FC1_INPUT : 0u) |
+            ((dit->rot_mask & H3_ROT_FC2) ? H3_GPU_ROTATE_FC2_INPUT : 0u)),
            "DiT int8 fused MLP");
     } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
@@ -2324,7 +2436,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->hidden, dit->int8_activation,
                 dit->int8_activation_scales, dit->hidden, mlp_output,
                 next_weight->norm1, modulation, next_modulation, row_map,
-                rows, padded_rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
+                rows, padded_rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f,
+                (dit->rot_mask & H3_ROT_QKV) != 0),
                "DiT fused MLP gate, next attention AdaLN and int8 quantization");
             *next_attention_input_quantized = 1;
         } else {
@@ -2931,6 +3044,223 @@ static int ensure_previous_velocities(h3_dit *dit, char *error,
     return 0;
 }
 
+/* ---- teacher forcing (Track A error study) ------------------------------
+ * H3_TEACHER_FORCE_DUMP=DIR (reference run): every evaluated step writes the
+ * DiT input latent rows it saw (step-NN.x, F32 video rows then audio rows)
+ * and its velocity (step-NN.v, BF16 video then audio rows); the run itself
+ * is unchanged.
+ * H3_TEACHER_FORCE_DIR=DIR (variant run): no sampling; each evaluated step
+ * (or only H3_TEACHER_FORCE_STEPS=a,b,...) is fed the reference input and its
+ * velocity is compared with the reference: one "h3 tf" line per step on
+ * stderr (and appended to H3_TEACHER_FORCE_LOG). The render then stops with
+ * "teacher forcing finished". */
+static int tf_file(const char *directory, int step, const char *suffix,
+                   char *path, size_t size) {
+    int written = snprintf(path, size, "%s/step-%02d.%s", directory, step,
+                           suffix);
+    return written > 0 && (size_t)written < size;
+}
+
+static int tf_write(const char *path, const void *first, size_t first_bytes,
+                    const void *second, size_t second_bytes) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    int ok = fwrite(first, 1, first_bytes, file) == first_bytes &&
+             fwrite(second, 1, second_bytes, file) == second_bytes;
+    return fclose(file) == 0 && ok;
+}
+
+static int tf_read(const char *path, void *data, size_t bytes) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    int ok = fread(data, 1, bytes, file) == bytes && fgetc(file) == EOF;
+    fclose(file);
+    return ok;
+}
+
+static double tf_now(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + 1e-9 * (double)now.tv_nsec;
+}
+
+static float tf_bf16(uint16_t bits) {
+    uint32_t word = (uint32_t)bits << 16;
+    float value;
+    memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
+static void tf_compare(const uint16_t *actual, const uint16_t *expected,
+                       size_t count, double *relative_l2, double *cosine) {
+    double diff = 0.0, norm = 0.0, actual_norm = 0.0, dot = 0.0;
+    for (size_t index = 0; index < count; index++) {
+        double a = tf_bf16(actual[index]), b = tf_bf16(expected[index]);
+        diff += (a - b) * (a - b);
+        norm += b * b;
+        actual_norm += a * a;
+        dot += a * b;
+    }
+    *relative_l2 = norm > 0.0 ? sqrt(diff / norm) : 0.0;
+    *cosine = norm > 0.0 && actual_norm > 0.0 ?
+        dot / sqrt(norm * actual_norm) : 0.0;
+}
+
+static int tf_dump_step(h3_dit *dit, const char *directory, int step,
+                        int input, size_t video_offset, size_t video_count,
+                        size_t audio_offset, size_t audio_count,
+                        char *error, size_t error_size) {
+    char path[1200];
+    int ok = tf_file(directory, step, input ? "x" : "v", path, sizeof(path));
+    if (input) {
+        float *video = malloc(video_count * sizeof(*video));
+        float *audio = malloc((audio_count ? audio_count : 1) *
+                              sizeof(*audio));
+        ok = ok && video && audio &&
+            h3_gpu_tensor_read_f32_range(dit->video_input, video_offset,
+                                         video, video_count) &&
+            (!audio_count || h3_gpu_tensor_read_f32_range(
+                dit->audio_input, audio_offset, audio, audio_count)) &&
+            tf_write(path, video, video_count * sizeof(*video),
+                     audio, audio_count * sizeof(*audio));
+        free(video);
+        free(audio);
+    } else {
+        uint16_t *video = malloc(video_count * sizeof(*video));
+        uint16_t *audio = malloc((audio_count ? audio_count : 1) *
+                                 sizeof(*audio));
+        ok = ok && video && audio &&
+            h3_gpu_tensor_read_bf16(dit->video_output_bf16, video,
+                                    video_count) &&
+            (!audio_count || h3_gpu_tensor_read_bf16(
+                dit->audio_output_bf16, audio, audio_count)) &&
+            tf_write(path, video, video_count * sizeof(*video),
+                     audio, audio_count * sizeof(*audio));
+        free(video);
+        free(audio);
+    }
+    if (!ok) fail(error, error_size, "cannot write teacher-forcing %s",
+                  path);
+    return ok;
+}
+
+static int teacher_force(h3_dit *dit, const char *directory,
+                         const uint8_t *selected, char *error,
+                         size_t error_size) {
+    if (dit->core_reuse_interval > 1) {
+        fail(error, error_size, "teacher forcing needs --core-reuse 1");
+        return 0;
+    }
+    uint8_t wanted[H3_MAX_STEPS];
+    memcpy(wanted, selected, sizeof(wanted));
+    const char *steps = getenv("H3_TEACHER_FORCE_STEPS");
+    if (steps && *steps) {
+        memset(wanted, 0, sizeof(wanted));
+        const char *cursor = steps;
+        while (*cursor) {
+            char *end = NULL;
+            long value = strtol(cursor, &end, 10);
+            if (end == cursor || value < 0 || value >= dit->sigmas.steps) {
+                fail(error, error_size, "bad H3_TEACHER_FORCE_STEPS");
+                return 0;
+            }
+            wanted[value] = selected[value];
+            cursor = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') {
+                fail(error, error_size, "bad H3_TEACHER_FORCE_STEPS");
+                return 0;
+            }
+        }
+    }
+    size_t video_count = (size_t)dit->video_rows * VIDEO_PATCH;
+    size_t audio_count = (size_t)dit->audio_rows * AUDIO_CHANNELS;
+    size_t video_offset = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t audio_offset = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    float *input = malloc((video_count + audio_count) * sizeof(*input));
+    uint16_t *expected = malloc((video_count + audio_count) *
+                                sizeof(*expected));
+    uint16_t *actual = malloc((video_count + audio_count) * sizeof(*actual));
+    const char *log_path = getenv("H3_TEACHER_FORCE_LOG");
+    FILE *log = log_path ? fopen(log_path, "a") : NULL;
+    int ok = input && expected && actual && (!log_path || log);
+    if (!ok) fail(error, error_size, "cannot start teacher forcing");
+    double sum_video = 0.0, sum_audio = 0.0, sum_ms = 0.0;
+    int count = 0;
+    for (int step = 0; ok && step < dit->sigmas.steps; step++) {
+        if (!wanted[step]) continue;
+        char path[1200];
+        ok = tf_file(directory, step, "x", path, sizeof(path)) &&
+             tf_read(path, input, (video_count + audio_count) *
+                                  sizeof(*input)) &&
+             tf_file(directory, step, "v", path, sizeof(path)) &&
+             tf_read(path, expected, (video_count + audio_count) *
+                                     sizeof(*expected));
+        if (!ok) {
+            fail(error, error_size, "cannot read teacher-forcing step %d "
+                 "from %s (layout mismatch?)", step, directory);
+            break;
+        }
+        ok = h3_gpu_tensor_write_f32_range(dit->video_input, video_offset,
+                                           input, video_count) &&
+             (!audio_count || h3_gpu_tensor_write_f32_range(
+                 dit->audio_input, audio_offset, input + video_count,
+                 audio_count));
+        if (!ok) {
+            fail(error, error_size, "cannot write teacher-forcing input");
+            break;
+        }
+        double started = tf_now();
+        ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                    "begin teacher-forced forward") &&
+             encode_forward(dit, step, 0, 0, 1, error, error_size) &&
+             gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                    "submit teacher-forced forward");
+        double milliseconds = 1e3 * (tf_now() - started);
+        ok = ok && h3_gpu_tensor_read_bf16(dit->video_output_bf16, actual,
+                                           video_count) &&
+             (!audio_count || h3_gpu_tensor_read_bf16(
+                 dit->audio_output_bf16, actual + video_count, audio_count));
+        if (!ok) {
+            if (error && !*error) fail(error, error_size, "teacher-forced step %d "
+                              "failed", step);
+            break;
+        }
+        double video_l2, video_cos, audio_l2 = 0.0, audio_cos = 1.0;
+        tf_compare(actual, expected, video_count, &video_l2, &video_cos);
+        if (audio_count)
+            tf_compare(actual + video_count, expected + video_count,
+                       audio_count, &audio_l2, &audio_cos);
+        fprintf(stderr, "h3 tf step=%d sigma=%.6f video_rel_l2=%.6e "
+                "video_cos=%.9f audio_rel_l2=%.6e audio_cos=%.9f ms=%.1f\n",
+                step, (double)dit->sigmas.video[step], video_l2, video_cos,
+                audio_l2, audio_cos, milliseconds);
+        if (log)
+            fprintf(log, "step=%d sigma=%.6f video_rel_l2=%.6e "
+                    "video_cos=%.9f audio_rel_l2=%.6e audio_cos=%.9f "
+                    "ms=%.1f\n", step, (double)dit->sigmas.video[step],
+                    video_l2, video_cos, audio_l2, audio_cos, milliseconds);
+        sum_video += video_l2;
+        sum_audio += audio_l2;
+        sum_ms += milliseconds;
+        count++;
+    }
+    if (ok && count) {
+        fprintf(stderr, "h3 tf mean steps=%d video_rel_l2=%.6e "
+                "audio_rel_l2=%.6e ms=%.1f\n", count, sum_video / count,
+                sum_audio / count, sum_ms / count);
+        if (log) fprintf(log, "mean steps=%d video_rel_l2=%.6e "
+                         "audio_rel_l2=%.6e ms=%.1f\n", count,
+                         sum_video / count, sum_audio / count,
+                         sum_ms / count);
+    }
+    if (log) fclose(log);
+    free(input);
+    free(expected);
+    free(actual);
+    if (ok) fail(error, error_size, "teacher forcing finished");
+    return 0;
+}
+
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                              float *audio_latent, int reuse_interval,
                              h3_dit_progress progress, void *progress_opaque,
@@ -2951,6 +3281,11 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     if (reuse_interval > 1 && getenv("H3_PROFILE"))
         fprintf(stderr, "h3: %s GPU reuse schedule has %d evaluations\n",
                 custom_count > 0 ? "custom" : "selected", selected_count);
+    const char *tf_directory = getenv("H3_TEACHER_FORCE_DIR");
+    if (tf_directory && *tf_directory)
+        return teacher_force(dit, tf_directory, selected, error, error_size);
+    const char *tf_dump = getenv("H3_TEACHER_FORCE_DUMP");
+    if (tf_dump && !*tf_dump) tf_dump = NULL;
     unsigned window = gpu_sampler_window();
     int disable_command_split = window == 1 &&
                                 getenv("H3_DIT_COMMAND_BLOCKS") == NULL;
@@ -3001,6 +3336,17 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         }
         if (!ok) break;
         int evaluate = selected[step];
+        if (evaluate && tf_dump) {
+            ok = gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                        "submit before teacher-forcing dump") &&
+                 tf_dump_step(dit, tf_dump, step, 1, video_offset,
+                              video_count, audio_offset, audio_count,
+                              error, error_size) &&
+                 gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                        "begin after teacher-forcing dump");
+            command_active = ok;
+            if (!ok) break;
+        }
         if (evaluate) {
             if (last_evaluated >= 0 && reuse_interval > 1) {
                 ok = gpu_op(dit, h3_gpu_copy_bf16(
@@ -3049,7 +3395,8 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 audio_ratio), error, error_size, "GPU audio Euler step");
         if (ok && (evaluate || preview)) {
             int finish = preview || step + 1 == dit->sigmas.steps ||
-                         (window && pending_evaluations >= window);
+                         (window && pending_evaluations >= window) ||
+                         (evaluate && tf_dump);
             ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
                                     : h3_gpu_continue(dit->gpu),
                         error, error_size,
@@ -3059,6 +3406,10 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 command_active = 0;
                 pending_evaluations = 0;
             }
+            if (ok && evaluate && tf_dump)
+                ok = tf_dump_step(dit, tf_dump, step, 0, video_offset,
+                                  video_count, audio_offset, audio_count,
+                                  error, error_size);
         }
         if (ok && preview) {
             ok = h3_gpu_tensor_read_f32_range(
@@ -3190,6 +3541,11 @@ int h3_dit_denoise_euler_preview(
         reuse_interval > 32 ||
         dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule)) {
         fail(error, error_size, "invalid Euler denoising arguments");
+        return 0;
+    }
+    if (!gpu_sampler_requested(dit) &&
+        (getenv("H3_TEACHER_FORCE_DIR") || getenv("H3_TEACHER_FORCE_DUMP"))) {
+        fail(error, error_size, "teacher forcing needs the GPU sampler");
         return 0;
     }
     if (gpu_sampler_requested(dit))
