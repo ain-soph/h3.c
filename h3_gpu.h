@@ -82,6 +82,9 @@ size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements);
+/* CPU view of a shared F32 tensor (valid while the tensor lives; read it only
+ * after the GPU work writing it has completed). */
+const float *h3_gpu_tensor_contents_f32(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
