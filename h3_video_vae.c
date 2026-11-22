@@ -8,6 +8,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1341,9 +1342,12 @@ static int decode_chunks_pipelined(vae_context *vae,
             }
         }
         if (ok && job + 1 < jobs) PREPARE(job + 1);
-        if (running)
+        /* on an error nothing half-encoded is run, and the committed work
+         * finishes before its buffers are freed */
+        if (running && ok)
             ok = gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
-                        "submit tiled video VAE decoder") && ok;
+                        "submit tiled video VAE decoder");
+        if (!ok) h3_gpu_abort(vae->gpu);
     }
 #undef PREPARE
     if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
@@ -1580,7 +1584,7 @@ int h3_video_vae_decode(const char *weight_directory,
 struct h3_video_vae_prefetch {
     pthread_t thread;
     char *directory;
-    volatile int stop;
+    atomic_int stop;
     size_t bytes;
 };
 
@@ -1591,18 +1595,22 @@ static void *prefetch_main(void *opaque) {
     size_t chunk = (size_t)8 << 20;
     unsigned char *buffer = malloc(chunk);
     struct dirent *entry;
-    while (buffer && directory && !prefetch->stop &&
+    while (buffer && directory &&
+           !atomic_load_explicit(&prefetch->stop, memory_order_relaxed) &&
            (entry = readdir(directory)) != NULL) {
         size_t length = strlen(entry->d_name);
         if (length < 12 || strcmp(entry->d_name + length - 12, ".safetensors"))
             continue;
         char path[4096];
         snprintf(path, sizeof(path), "%s/%s", prefetch->directory, entry->d_name);
-        int descriptor = open(path, O_RDONLY);
+        int descriptor = open(path, O_RDONLY | O_CLOEXEC);
         if (descriptor < 0) continue;
-        ssize_t count;
-        while (!prefetch->stop && (count = read(descriptor, buffer, chunk)) > 0)
+        while (!atomic_load_explicit(&prefetch->stop, memory_order_relaxed)) {
+            ssize_t count = read(descriptor, buffer, chunk);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
             prefetch->bytes += (size_t)count;
+        }
         close(descriptor);
     }
     if (directory) closedir(directory);
@@ -1613,6 +1621,7 @@ static void *prefetch_main(void *opaque) {
 h3_video_vae_prefetch *h3_video_vae_prefetch_start(const char *weight_directory) {
     if (!pipeline_enabled() || !weight_directory) return NULL;
     h3_video_vae_prefetch *prefetch = calloc(1, sizeof(*prefetch));
+    if (prefetch) atomic_init(&prefetch->stop, 0);
     if (!prefetch || !(prefetch->directory = strdup(weight_directory)) ||
         pthread_create(&prefetch->thread, NULL, prefetch_main, prefetch)) {
         if (prefetch) free(prefetch->directory);
@@ -1624,7 +1633,7 @@ h3_video_vae_prefetch *h3_video_vae_prefetch_start(const char *weight_directory)
 
 void h3_video_vae_prefetch_finish(h3_video_vae_prefetch *prefetch) {
     if (!prefetch) return;
-    prefetch->stop = 1;
+    atomic_store_explicit(&prefetch->stop, 1, memory_order_relaxed);
     pthread_join(prefetch->thread, NULL);
     if (getenv("H3_PROFILE"))
         fprintf(stderr, "h3: video VAE prefetch read %.2f GiB\n",

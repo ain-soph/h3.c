@@ -800,11 +800,15 @@ static h3_gpu_tensor *opt_block(encoder_context *encoder, h3_gpu_tensor *input,
 }
 
 /* Encodes one tile from `input` (normalized pixels [T][H][W][3]) into the
- * open command chain; *moments receives the quant_conv output tensor (from
- * the arena; the caller hands it back after reading it). */
+ * open command chain; the quant_conv output goes to *moments, a small tensor
+ * outside the arena (allocated on first use, `*capacity` elements; every tile
+ * has the same size). Keeping it out of the arena matters: it stays busy
+ * until the next tile has been encoded, and from the arena it could pin a
+ * multi-GB level-0 slot and force one more such slot on the tile after. */
 static int opt_encode_tile(encoder_context *encoder, h3_gpu_tensor *input,
                            int frames, int height, int width,
-                           h3_gpu_tensor **moments, uint32_t *latent_depth,
+                           h3_gpu_tensor **moments, size_t *capacity,
+                           uint32_t *latent_depth,
                            uint32_t *latent_height, uint32_t *latent_width,
                            char *error, size_t error_size) {
     uint32_t depth = (uint32_t)frames, h = (uint32_t)height, w = (uint32_t)width;
@@ -838,17 +842,21 @@ static int opt_encode_tile(encoder_context *encoder, h3_gpu_tensor *input,
         error, error_size);
     pool_put(encoder, hidden);
     if (!conv_moments) return 0;
-    h3_gpu_tensor *quant = pool_get(encoder, tensor_elements(
-        depth, h, w, MOMENT_CHANNELS));
+    size_t quant_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
+    if (*moments && *capacity < quant_count) {
+        h3_gpu_tensor_free(*moments);
+        *moments = NULL;
+        *capacity = 0;
+    }
+    if (!*moments && (*moments = h3_gpu_tensor_new_f32(encoder->gpu,
+                                                       quant_count)) != NULL)
+        *capacity = quant_count;
+    h3_gpu_tensor *quant = *moments;
     int ok = quant && enc_conv3d(encoder, quant, conv_moments, &encoder->quant,
                                  depth, h, w, error, error_size);
     if (!quant) fail(error, error_size, "cannot allocate visual encoder output");
     pool_put(encoder, conv_moments);
-    if (!ok) {
-        pool_put(encoder, quant);
-        return 0;
-    }
-    *moments = quant;
+    if (!ok) return 0;
     *latent_depth = depth;
     *latent_height = h;
     *latent_width = w;
@@ -914,8 +922,8 @@ static int prepare_fast_weight(encoder_context *encoder, encoder_conv *conv) {
 }
 
 static int prepare_fast_weights(encoder_context *encoder) {
-    int ok = h3_gpu_begin(encoder->gpu) &&
-             prepare_fast_weight(encoder, &encoder->conv_in);
+    int began = h3_gpu_begin(encoder->gpu);
+    int ok = began && prepare_fast_weight(encoder, &encoder->conv_in);
     for (int level = 0; ok && level < LEVELS; level++) {
         for (int block = 0; ok && block < BLOCKS; block++)
             ok = prepare_fast_weight(encoder, &encoder->levels[level].blocks[block].conv1) &&
@@ -924,7 +932,9 @@ static int prepare_fast_weights(encoder_context *encoder) {
             ok = prepare_fast_weight(encoder, &encoder->levels[level].downsample);
     }
     ok = ok && prepare_fast_weight(encoder, &encoder->conv_out);
-    return h3_gpu_submit(encoder->gpu) && ok;
+    if (began && ok) return h3_gpu_submit(encoder->gpu);
+    if (began) h3_gpu_abort(encoder->gpu);
+    return 0;
 }
 
 static int opt_encode_tiles(encoder_context *encoder, const float *pixels,
@@ -945,6 +955,7 @@ static int opt_encode_tiles(encoder_context *encoder, const float *pixels,
         h3_gpu_tensor_new_f32(encoder->gpu, pixel_count)
     };
     h3_gpu_tensor *moments[2] = {NULL, NULL};
+    size_t moment_capacity[2] = {0, 0};
     uint32_t dims[2][3] = {{0}};
     int ok = normalized && inputs[0] && inputs[1];
     if (!ok) fail(error, error_size, "cannot allocate visual encoder pixels");
@@ -964,7 +975,7 @@ static int opt_encode_tiles(encoder_context *encoder, const float *pixels,
                         "begin visual encoder tile") &&
                  opt_encode_tile(encoder, inputs[slot], frames, y_axis->length,
                                  x_axis->length, &moments[slot],
-                                 &dims[slot][0], &dims[slot][1], &dims[slot][2],
+                                 &moment_capacity[slot], &dims[slot][0], &dims[slot][1], &dims[slot][2],
                                  error, error_size) &&
                  gpu_op(encoder, h3_gpu_continue(encoder->gpu), error,
                         error_size, "commit visual encoder tile");
@@ -984,8 +995,6 @@ static int opt_encode_tiles(encoder_context *encoder, const float *pixels,
                  (!*latent_time || *latent_time == (int)dims[previous][0]);
             if (!ok) fail(error, error_size, "cannot read visual encoder latent");
             if (ok) *latent_time = (int)dims[previous][0];
-            pool_put(encoder, moments[previous]);
-            moments[previous] = NULL;
             if (ok && progress) progress(tile, tile_count, progress_opaque);
         }
         if (ok && tile + 1 < tile_count) {
@@ -997,14 +1006,19 @@ static int opt_encode_tiles(encoder_context *encoder, const float *pixels,
             ok = h3_gpu_tensor_write_f32(inputs[next & 1], normalized,
                                          pixel_count);
         }
-        if (running)
+        /* on an error nothing half-encoded is run, and the committed work
+         * finishes before its buffers are freed */
+        if (running && ok)
             ok = gpu_op(encoder, h3_gpu_submit(encoder->gpu), error,
-                        error_size, "submit visual encoder tile") && ok;
+                        error_size, "submit visual encoder tile");
+        if (!ok) h3_gpu_abort(encoder->gpu);
     }
     free(normalized);
     free(raw);
     h3_gpu_tensor_free(inputs[0]);
     h3_gpu_tensor_free(inputs[1]);
+    h3_gpu_tensor_free(moments[0]);
+    h3_gpu_tensor_free(moments[1]);
     return ok;
 }
 
@@ -1196,8 +1210,8 @@ int h3_video_vae_encode(const char *weight_directory,
     else if (opt && bf16_env && !strcmp(bf16_env, "1"))
         encoder.conv_mode = 1;
     if (ok && encoder.conv_mode && !prepare_fast_weights(&encoder)) {
-        fail(error, error_size, "cannot prepare visual encoder variant weights: %s",
-             h3_gpu_error(encoder.gpu));
+        fail(error, error_size, "cannot prepare visual encoder variant weights "
+             "(out of memory or Metal error: %s)", h3_gpu_error(encoder.gpu));
         ok = 0;
     }
     if (ok && opt)

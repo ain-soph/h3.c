@@ -5,6 +5,7 @@
  * Usage: h3_bitexact_vae_ops [SEED...]   (default seeds 1 2 3; run from the
  * checkout so h3_shaders.metal / h3_attention.metal are found) */
 #include "h3_gpu.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +82,18 @@ static h3_gpu_tensor *bf16(size_t count) {
 static h3_gpu_tensor *f32(size_t count) {
     h3_gpu_tensor *tensor = h3_gpu_tensor_new_f32(gpu, count);
     if (!tensor) { fprintf(stderr, "allocation failed\n"); exit(2); }
+    return tensor;
+}
+
+/* BF16 buffer filled with NaN: padding rows the kernels must never let leak
+ * into the compared rows (the decoder's padded rows hold stale values) */
+static h3_gpu_tensor *bf16_nan(size_t count) {
+    uint16_t *values = malloc(count * sizeof(*values));
+    if (!values) { fprintf(stderr, "allocation failed\n"); exit(2); }
+    for (size_t i = 0; i < count; i++) values[i] = 0x7fc0;
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, values, count);
+    free(values);
+    if (!tensor) { fprintf(stderr, "upload failed\n"); exit(2); }
     return tensor;
 }
 
@@ -220,8 +233,8 @@ static size_t test_linear(uint32_t rows, uint32_t in, uint32_t out,
     fill(b, 1, out, 0);
     h3_gpu_tensor *input = upload(x, (size_t)rows * in);
     h3_gpu_tensor *weight_f32 = upload(w, (size_t)out * in), *bias = upload(b, out);
-    h3_gpu_tensor *weight = bf16((size_t)out * in), *scratch = bf16(padded * in),
-                  *x16 = bf16(padded * in);
+    h3_gpu_tensor *weight = bf16((size_t)out * in), *scratch = bf16_nan(padded * in),
+                  *x16 = bf16_nan(padded * in);
     h3_gpu_tensor *reference = f32((size_t)rows * out), *fused = f32((size_t)rows * out);
     begin();
     run("weight to BF16",
@@ -289,8 +302,11 @@ static size_t test_encoder_conv(void) {
     fill(w, cout, cin * 27, 0);
     for (size_t i = 0; i < weights; i++) w[i] *= 0.01f;
     fill(b, 1, cout, 0);
+    float *x_big = malloc((count + 65536) * sizeof(*x_big));
+    memcpy(x_big, x, count * sizeof(*x));
+    for (size_t i = count; i < count + 65536; i++) x_big[i] = NAN;
     h3_gpu_tensor *input = upload(x, count), *weight = upload(w, weights),
-                  *bias = upload(b, cout);
+                  *bias = upload(b, cout), *input_big = upload(x_big, count + 65536);
     h3_gpu_tensor *reference = f32(out), *arena = f32(out * 2);
     begin();
     run("reference Conv3d",
@@ -299,13 +315,14 @@ static size_t test_encoder_conv(void) {
     for (int repeat = 0; repeat < 2; repeat++) {   /* second call: cached data */
         begin();
         run("arena Conv3d",
-            h3_gpu_conv3d_f32_ex(gpu, arena, input, weight, bias, 1, depth, height,
+            h3_gpu_conv3d_f32_ex(gpu, arena, input_big, weight, bias, 1, depth, height,
                                  width, cin, cout, 3, 3, 3, 1, 1, 1, 0));
     }
-    compare_f32("Conv3d, cached weights + big buffer", reference, arena, out);
-    h3_gpu_tensor *all[] = {input, weight, bias, reference, arena};
+    compare_f32("Conv3d, cached weights + big buffers (NaN input tail)", reference,
+                arena, out);
+    h3_gpu_tensor *all[] = {input, input_big, weight, bias, reference, arena};
     for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) h3_gpu_tensor_free(all[i]);
-    free(x); free(w); free(b);
+    free(x); free(x_big); free(w); free(b);
     return count + weights + cout;
 }
 
@@ -352,6 +369,12 @@ int main(int argc, char **argv) {
                                            "encoder norm+pad (2,0,1)");
         generated += test_encoder_norm_pad(1, 16, 16, 1024, 2, 1, 1,
                                            "encoder norm+pad T=1");
+        generated += test_encoder_norm_pad(3, 2, 2, 512, 2, 1, 1,
+                                           "encoder norm+pad 2x2");
+        generated += test_encoder_norm_pad(2, 3, 3, 256, 2, 1, 1,
+                                           "encoder norm+pad 3x3");
+        generated += test_encoder_norm_pad(1, 16, 16, 128, 0, 1, 1,
+                                           "encoder norm+pad front 0");
         generated += test_encoder_conv();
         test_round_trip();
         printf("  random input values: %zu\n", generated);

@@ -111,6 +111,9 @@ int h3_gpu_continue(h3_gpu *gpu);
  * the newer ones). */
 int h3_gpu_retire(h3_gpu *gpu, unsigned keep);
 int h3_gpu_submit(h3_gpu *gpu);
+/* Error path: drops the open command buffer uncommitted and waits until every
+ * committed one has finished, so tensors can be freed safely afterwards. */
+void h3_gpu_abort(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown

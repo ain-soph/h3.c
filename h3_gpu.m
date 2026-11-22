@@ -185,8 +185,9 @@ static MPSGraphTensorData *h3_gpu_graph_data(const h3_gpu_tensor *tensor,
     if (!stable || getenv("H3_DISABLE_GRAPH_DATA_CACHE"))
         return [[MPSGraphTensorData alloc] initWithMTLBuffer:object.buffer
             shape:shape dataType:data_type];
-    if (object.graphData && object.graphDataShape == shape &&
-        object.graphDataType == data_type) return object.graphData;
+    if (object.graphData && object.graphDataType == data_type &&
+        (object.graphDataShape == shape ||
+         [object.graphDataShape isEqualToArray:shape])) return object.graphData;
     MPSGraphTensorData *data = [[MPSGraphTensorData alloc]
         initWithMTLBuffer:object.buffer shape:shape dataType:data_type];
     if (!object.graphData) {
@@ -579,6 +580,9 @@ void h3_gpu_free(h3_gpu *gpu) {
         id<MTLDevice> device = object.device;
         NSUInteger before = device.currentAllocatedSize;
         object.command = nil;
+        object.mpsCommand = nil;
+        for (id<MTLCommandBuffer> pending in object.inflightCommands)
+            [pending waitUntilCompleted];
         object.inflightCommands = nil;
         object.sdpaCache = nil;
         object.linearCache = nil;
@@ -1124,6 +1128,23 @@ int h3_gpu_submit(h3_gpu *opaque) {
         [gpu.inflightCommands removeAllObjects];
     }
     return 1;
+}
+
+void h3_gpu_abort(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu) return;
+    @autoreleasepool {
+        /* the open buffer is dropped uncommitted; everything already committed
+         * (ours, and roots MPS committed itself) finishes before the marker */
+        gpu.command = nil;
+        gpu.mpsCommand = nil;
+        id<MTLCommandBuffer> marker = [gpu.queue commandBuffer];
+        [marker commit];
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands)
+            [pending waitUntilCompleted];
+        [marker waitUntilCompleted];
+        [gpu.inflightCommands removeAllObjects];
+    }
 }
 
 const char *h3_gpu_error(const h3_gpu *opaque) {
@@ -2117,6 +2138,11 @@ int h3_gpu_linear_bf16_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"NAX mixed-precision linear is unavailable");
         return 0;
     }
+    if (!h3_gpu_require_bf16(gpu, weight, (size_t)output_dim * input_dim, @"mixed linear weight") ||
+        !h3_gpu_require_elements(gpu, output, (size_t)rows * output_dim, @"mixed linear output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_dim, @"mixed linear bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32))) return 0;
     return h3_gpu_cast_f32_to_bf16(opaque, scratch, input, (uint32_t)((size_t)rows * input_dim)) &&
            h3_gpu_encode_linear_bf16_f32out(gpu, output, scratch, weight, bias,
                                             rows, input_dim, output_dim);
@@ -2329,8 +2355,12 @@ int h3_gpu_video_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
     H3GPU *gpu = GPU(opaque);
     size_t count = (size_t)sequence * heads * head_dim;
     size_t rope_count = (size_t)sequence * rope_half;
-    if (head_dim != 64 || rope_half * 2 > head_dim ||
-        !h3_gpu_require_elements(gpu, qkv, count * 3, @"video QKV") ||
+    if (!gpu) return 0;
+    if (!sequence || !heads || head_dim != 64 || rope_half * 2 > head_dim) {
+        h3_gpu_set_error(gpu, @"video QKV RoPE needs head_dim 64 and a non-empty grid");
+        return 0;
+    }
+    if (!h3_gpu_require_elements(gpu, qkv, count * 3, @"video QKV") ||
         TENSOR(qkv).dtype != H3_GPU_F32 ||
         !h3_gpu_require_elements(gpu, rope_cos, rope_count, @"video RoPE cosine") ||
         TENSOR(rope_cos).dtype != H3_GPU_F32 ||

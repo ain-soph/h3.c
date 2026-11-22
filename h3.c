@@ -1840,9 +1840,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
     h3_debug_hash("noise-video", 0, video, video_count * sizeof(*video));
-    /* B3: warm the decoder weights' pages while the DiT runs (no-op when the
-     * resident decoder is already loaded). */
-    if (!preview_decoder) vae_prefetch = h3_video_vae_prefetch_start(vae_path);
+    /* B3: warm the decoder weights' pages while the DiT runs. Skipped when a
+     * decoder is already resident (live preview, or the cached one: a cached
+     * decoder with another key was freed above) and with --ssd-streaming,
+     * whose DiT reads compete for the same SSD. */
+    if (!preview_decoder && !(ctx->cache_enabled && ctx->video_decoder) &&
+        !params->ssd_streaming)
+        vae_prefetch = h3_video_vae_prefetch_start(vae_path);
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
