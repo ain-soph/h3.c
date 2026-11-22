@@ -15,7 +15,7 @@
 > | Video VAE decoder: BF16 GEMM inputs written directly (Track B1) | every BF16 linear re-rounded an F32 activation | `H3_VAE_FUSED` (default on with `H3_VAE_BF16`; `0` = separate kernels) | 768p 5 s VAE decode 24.43 → 21.72 s; byte-identical frames |
 > | Video VAE decoder: pipelined tiles + weight page prefetch (Track B3) | GPU idle while the CPU unpacks / stitches each tile | `H3_VAE_PREFETCH` (default on; `0` = serial) | 768p VAE decode 21.72 → 21.10 s; byte-identical |
 > | Video VAE encoder: buffer arena, one command chain per tile, fused GroupNorm+SiLU+pad (Track B4) | a sync wait and fresh multi-GB buffers per residual block | `H3_VAE_ENC_OPT` (default on; `0` = per-op path) | Ref2VA 3 s context 768p 156.6 → 127.4 s, 512² 50.3 → 41.1 s; FL2VA 768p 4.95 → 3.33 s per image; byte-identical latents |
-> | Encoder opt-in variants (never default) | single-image 2D conv / BF16 convs | `H3_VAE_ENC_FAST=1`, `H3_VAE_ENC_BF16=1` | not byte-identical; see llm-serving reports/h3-optimization.md (Track B) |
+> | Encoder opt-in variants (never default) | single-image 2D conv / BF16 convs | `H3_VAE_ENC_FAST=1`, `H3_VAE_ENC_BF16=1` (off) | not byte-identical: FAST 3.33 → 0.62 s per 768p image, latent rel. L2 2.6e-6 (misses the 1e-6 equivalence gate); BF16 Ref2VA 768p 127.4 → 110.9 s, rel. L2 2.2–2.7% |
 >
 > Full numbers: [MiniMax H3 Video in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#视频音频minimax-h3-video). Upstream PRs: [#98](https://github.com/antirez/h3.c/pull/98), [#99](https://github.com/antirez/h3.c/pull/99) (open).
 
