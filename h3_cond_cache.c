@@ -19,8 +19,12 @@
 extern char **environ;
 
 #define H3CC_MAGIC "H3CONDC1"
-#define H3CC_VERSION 1u
-#define H3CC_SMALL_FILE (64ull << 20)   /* content-hash files up to this size */
+#define H3CC_VERSION 2u                   /* 2: entry hash covers the header */
+#define H3CC_SMALL_FILE (64ull << 20)     /* content-hash files up to this size */
+#define H3CC_MAX_TOKENS (1u << 20)
+#define H3CC_MAX_LATENT 4096              /* per latent axis */
+#define H3CC_MAX_AUDIO_T (1 << 20)
+#define H3CC_MAX_MB (1ull << 20)          /* H3_COND_CACHE_MAX_MB clamp (1 TiB) */
 
 typedef struct {
     char magic[8];
@@ -36,7 +40,8 @@ typedef struct {
     uint32_t conditioned;
     uint32_t has_tags;
     unsigned char key_sha[CC_SHA256_DIGEST_LENGTH];
-    unsigned char payload_sha[CC_SHA256_DIGEST_LENGTH];
+    /* SHA-256 of this header (with entry_sha zeroed) + key + payload */
+    unsigned char entry_sha[CC_SHA256_DIGEST_LENGTH];
 } h3cc_header;
 
 typedef struct {
@@ -81,6 +86,18 @@ static void h3cc_append(h3cc_text *key, const char *format, ...) {
     key->length += (size_t)needed;
 }
 
+/* snprintf into a fixed buffer; 0 when it did not fit. */
+static int h3cc_format(char *out, size_t size, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static int h3cc_format(char *out, size_t size, const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    int written = vsnprintf(out, size, format, arguments);
+    va_end(arguments);
+    return written >= 0 && (size_t)written < size;
+}
+
 static void h3cc_hex(const unsigned char *digest, char *out) {
     static const char digits[] = "0123456789abcdef";
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
@@ -90,16 +107,33 @@ static void h3cc_hex(const unsigned char *digest, char *out) {
     out[2 * CC_SHA256_DIGEST_LENGTH] = '\0';
 }
 
-static void h3cc_sha(const void *data, size_t bytes, unsigned char *digest) {
-    CC_SHA256_CTX context;
-    CC_SHA256_Init(&context);
+static void h3cc_sha_update(CC_SHA256_CTX *context, const void *data,
+                            size_t bytes) {
     const unsigned char *p = data;
     while (bytes) {
         CC_LONG chunk = bytes > (1u << 30) ? (1u << 30) : (CC_LONG)bytes;
-        CC_SHA256_Update(&context, p, chunk);
+        CC_SHA256_Update(context, p, chunk);
         p += chunk;
         bytes -= chunk;
     }
+}
+
+static void h3cc_sha(const void *data, size_t bytes, unsigned char *digest) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    h3cc_sha_update(&context, data, bytes);
+    CC_SHA256_Final(digest, &context);
+}
+
+static void h3cc_entry_sha(const h3cc_header *header, const void *key,
+                           const void *payload, unsigned char *digest) {
+    h3cc_header copy = *header;
+    memset(copy.entry_sha, 0, sizeof(copy.entry_sha));
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    h3cc_sha_update(&context, &copy, sizeof(copy));
+    h3cc_sha_update(&context, key, (size_t)header->key_bytes);
+    h3cc_sha_update(&context, payload, (size_t)header->payload_bytes);
     CC_SHA256_Final(digest, &context);
 }
 
@@ -127,7 +161,8 @@ static int h3cc_file_sha(const char *path, char *hex) {
 }
 
 /* One file: its content hash (media and small files) or, for large weight
- * files, the resolved path, size, mtime, device and inode. */
+ * files, the resolved path, size, mtime, device and inode. A file that cannot
+ * be identified disables the cache for this request. */
 static void h3cc_file(h3cc_text *key, const char *role, const char *path,
                       int content) {
     if (!path) {
@@ -136,8 +171,9 @@ static void h3cc_file(h3cc_text *key, const char *role, const char *path,
     }
     struct stat status;
     char resolved[PATH_MAX];
-    if (stat(path, &status) != 0 || !realpath(path, resolved)) {
-        key->failed = 1;   /* a missing input: do not cache this request */
+    if (stat(path, &status) != 0 || !S_ISREG(status.st_mode) ||
+        !realpath(path, resolved)) {
+        key->failed = 1;
         return;
     }
     if (content || (uint64_t)status.st_size <= H3CC_SMALL_FILE) {
@@ -192,16 +228,17 @@ static void h3cc_directory(h3cc_text *key, const char *role,
         count++;
     }
     closedir(dir);
-    qsort(names, count, sizeof(*names), h3cc_compare_names);
+    if (count) qsort(names, count, sizeof(*names), h3cc_compare_names);
     for (size_t index = 0; index < count && !key->failed; index++) {
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", directory, names[index]);
-        struct stat status;
-        if (stat(path, &status) == 0 && S_ISREG(status.st_mode)) {
-            char label[512];
-            snprintf(label, sizeof(label), "%s/%s", role, names[index]);
-            h3cc_file(key, label, path, 0);
+        char path[PATH_MAX], label[PATH_MAX];
+        if (!h3cc_format(path, sizeof(path), "%s/%s", directory, names[index]) ||
+            !h3cc_format(label, sizeof(label), "%s/%s", role, names[index])) {
+            key->failed = 1;
+            break;
         }
+        struct stat status;
+        if (stat(path, &status) == 0 && S_ISREG(status.st_mode))
+            h3cc_file(key, label, path, 0);
     }
     for (size_t index = 0; index < count; index++) free(names[index]);
     free(names);
@@ -233,7 +270,7 @@ static void h3cc_environment(h3cc_text *key) {
         if ((!strncmp(*e, "H3_", 3) || !strncmp(*e, "MTL_", 4) ||
              !strncmp(*e, "METAL_", 6)) && !h3cc_env_ignored(*e))
             list[kept++] = *e;
-    qsort(list, kept, sizeof(*list), h3cc_compare_names);
+    if (kept) qsort(list, kept, sizeof(*list), h3cc_compare_names);
     for (size_t i = 0; i < kept; i++)
         h3cc_append(key, "\nenv=%zu:%s", strlen(list[i]), list[i]);
     free(list);
@@ -258,8 +295,11 @@ static void h3cc_program(h3cc_text *key, const char *role, const char *env,
     for (char *dir = strtok_r(copy, ":", &save); dir;
          dir = strtok_r(NULL, ":", &save)) {
         char candidate[PATH_MAX];
-        snprintf(candidate, sizeof(candidate), "%s/%s", *dir ? dir : ".", name);
-        if (access(candidate, X_OK) == 0) {
+        if (!h3cc_format(candidate, sizeof(candidate), "%s/%s",
+                         *dir ? dir : ".", name)) continue;
+        struct stat status;
+        if (stat(candidate, &status) == 0 && S_ISREG(status.st_mode) &&
+            access(candidate, X_OK) == 0) {
             char resolved[PATH_MAX];
             h3cc_append(key, "\n%s-path=%s", role,
                         realpath(candidate, resolved) ? resolved : candidate);
@@ -303,40 +343,91 @@ static char *h3cc_sibling(const char *path, const char *name) {
     return result;
 }
 
+static int h3cc_layout_kind(h3_reference_kind kind) {
+    switch (kind) {
+    case H3_REFERENCE_IMAGE: return H3_LAYOUT_REF_IMAGE;
+    case H3_REFERENCE_AUDIO: return H3_LAYOUT_REF_AUDIO;
+    case H3_REFERENCE_VIDEO:
+    case H3_REFERENCE_VIDEO_AUDIO: return H3_LAYOUT_REF_VIDEO;
+    }
+    return -1;
+}
+
+/* H3_COND_CACHE_MAX_MB as bytes: default 2048 MiB, clamped to [1, 2^20]. */
+static uint64_t h3cc_max_bytes(void) {
+    const char *limit = getenv("H3_COND_CACHE_MAX_MB");
+    unsigned long long megabytes = 2048;
+    if (limit && *limit) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(limit, &end, 10);
+        if (*limit != '-' && end && end != limit && !*end) {
+            if (errno == ERANGE || parsed > H3CC_MAX_MB) parsed = H3CC_MAX_MB;
+            megabytes = parsed ? parsed : 1;
+        }
+    }
+    return (uint64_t)megabytes << 20;
+}
+
 int h3_cond_disk_open(h3_cond_disk *disk, const h3_cond_disk_inputs *in) {
     memset(disk, 0, sizeof(*disk));
     const char *directory = getenv("H3_COND_CACHE_DIR");
     if (!directory || !*directory) return 0;
     const h3_params *params = in->params;
+    if (in->ref2va && params->reference_count > H3_COND_MAX_REFERENCES)
+        return 0;
     h3cc_text key = {0};
     h3cc_append(&key, "h3 conditioning cache v%u", H3CC_VERSION);
     h3cc_append(&key, "\nmode=%d\nprompt=%zu:%s", in->ref2va,
                 strlen(in->prompt), in->prompt);
     int media = in->ref2va || params->first_frame || params->last_frame;
+    size_t visual = 0;
     if (media) {
         h3cc_append(&key, "\nrender=%dx%d\nframes=%d\nimage-size=%d",
                     in->render_width, in->render_height, params->frames,
                     params->reference_image_size);
         h3cc_file(&key, "first", params->first_frame, 1);
         h3cc_file(&key, "last", params->last_frame, 1);
-        for (size_t index = 0; index < params->reference_count; index++) {
+        for (size_t index = 0; in->ref2va && index < params->reference_count;
+             index++) {
             const h3_reference *reference = &params->references[index];
+            int kind = h3cc_layout_kind(reference->kind);
+            if (kind < 0) key.failed = 1;
+            disk->expect_kinds[index] = kind;
+            visual += kind != H3_LAYOUT_REF_AUDIO;
             h3cc_append(&key, "\nref=%d:%d", (int)reference->kind,
                         reference->include_embedded_audio);
             h3cc_file(&key, "ref-media", reference->path, 1);
             h3cc_file(&key, "ref-audio", reference->audio_path, 1);
         }
+        if (!in->ref2va)
+            visual = (size_t)(params->first_frame != NULL) +
+                     (size_t)(params->last_frame != NULL);
         h3cc_program(&key, "ffmpeg", "H3_FFMPEG", "ffmpeg");
         h3cc_program(&key, "ffprobe", "H3_FFPROBE", "ffprobe");
         h3cc_directory(&key, "video-vae", in->video_vae_path);
+        /* The video encoder reads latents_mean / latents_std from the config
+         * one level above its weights (h3_video_encoder.c). */
+        size_t config_size = strlen(in->video_vae_path) + sizeof("/../config.json");
+        char *config = malloc(config_size);
+        if (config) {
+            snprintf(config, config_size, "%s/../config.json", in->video_vae_path);
+            h3cc_file(&key, "video-vae-config", config, 1);
+            free(config);
+        } else {
+            key.failed = 1;
+        }
         h3cc_directory(&key, "audio-vae", in->audio_vae_path);
     }
     h3cc_file(&key, "tokenizer", in->tokenizer_path, 1);
     h3cc_directory(&key, "text-encoder", in->text_path);
     h3cc_file(&key, "shaders", in->shader_path, 1);
     char *attention = h3cc_sibling(in->shader_path, "h3_attention.metal");
-    if (attention && access(attention, R_OK) == 0)
+    if (!attention) key.failed = 1;
+    else if (access(attention, F_OK) == 0)
         h3cc_file(&key, "attention-shaders", attention, 1);
+    else
+        h3cc_append(&key, "\nattention-shaders=absent");
     free(attention);
     h3cc_executable(&key);
     h3cc_sysctl(&key, "kern.osversion");
@@ -344,15 +435,17 @@ int h3_cond_disk_open(h3_cond_disk *disk, const h3_cond_disk_inputs *in) {
     h3cc_append(&key, "\ngpu=%s", in->device_name ? in->device_name : "?");
     h3cc_environment(&key);
     if (key.failed || !key.text) {
-        fprintf(stderr, "h3: conditioning disk cache: cannot build the key; "
-                        "not cached\n");
+        fprintf(stderr, "h3: conditioning disk cache: cannot identify every "
+                        "input; not cached\n");
         free(key.text);
+        memset(disk, 0, sizeof(*disk));
         return 0;
     }
     if (mkdir(directory, 0700) != 0 && errno != EEXIST) {
         fprintf(stderr, "h3: conditioning disk cache: cannot create %s: %s\n",
                 directory, strerror(errno));
         free(key.text);
+        memset(disk, 0, sizeof(*disk));
         return 0;
     }
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
@@ -362,16 +455,19 @@ int h3_cond_disk_open(h3_cond_disk *disk, const h3_cond_disk_inputs *in) {
     size_t path_size = strlen(directory) + sizeof(hex) + 8;
     disk->path = malloc(path_size);
     disk->directory = strdup(directory);
-    if (!disk->path || !disk->directory) {
+    if (!disk->path || !disk->directory ||
+        !h3cc_format(disk->path, path_size, "%s/%s.h3cc", directory, hex)) {
         free(key.text);
         h3_cond_disk_close(disk);
         return 0;
     }
-    snprintf(disk->path, path_size, "%s/%s.h3cc", directory, hex);
     disk->key = key.text;
-    const char *limit = getenv("H3_COND_CACHE_MAX_MB");
-    long long megabytes = limit && *limit ? atoll(limit) : 2048;
-    disk->max_bytes = (uint64_t)(megabytes > 0 ? megabytes : 2048) << 20;
+    disk->max_bytes = h3cc_max_bytes();
+    disk->ref2va = in->ref2va;
+    disk->expect_conditioned = media;
+    disk->expect_tags = visual != 0;
+    disk->expect_references = in->ref2va ? params->reference_count : 0;
+    disk->expect_video_elements = in->ref2va ? 0 : in->fl2va_video_elements;
     return 1;
 }
 
@@ -383,26 +479,90 @@ void h3_cond_disk_close(h3_cond_disk *disk) {
     memset(disk, 0, sizeof(*disk));
 }
 
+/* Payload bytes for the header's counts; 0 on overflow or out-of-range
+ * counts (never wraps). */
 static int h3cc_sizes(const h3cc_header *header, uint64_t *payload) {
-    uint64_t total = 0, part;
-    if (header->width && header->tokens > UINT64_MAX / header->width / 2)
-        return 0;
-    total = header->tokens * header->width * 2;
-    if (header->has_tags) total += header->tokens;
-    if (header->video_elements > (UINT64_MAX >> 3)) return 0;
-    total += header->video_elements * 4;
-    if (header->audio_elements > (UINT64_MAX >> 3)) return 0;
-    total += header->audio_elements * 4;
-    part = header->reference_count * 5 * 4;
-    total += part;
+    uint64_t values, video, audio, refs, total;
+    if (header->tokens > H3CC_MAX_TOKENS || header->width > (1u << 16) ||
+        header->reference_count > H3_COND_MAX_REFERENCES ||
+        __builtin_mul_overflow(header->tokens, header->width, &values) ||
+        __builtin_mul_overflow(values, (uint64_t)2, &values) ||
+        __builtin_mul_overflow(header->video_elements, (uint64_t)4, &video) ||
+        __builtin_mul_overflow(header->audio_elements, (uint64_t)4, &audio) ||
+        __builtin_mul_overflow(header->reference_count, (uint64_t)20, &refs) ||
+        __builtin_add_overflow(values, header->has_tags ? header->tokens : 0,
+                               &total) ||
+        __builtin_add_overflow(total, video, &total) ||
+        __builtin_add_overflow(total, audio, &total) ||
+        __builtin_add_overflow(total, refs, &total)) return 0;
     *payload = total;
     return 1;
 }
 
-static void h3cc_drop(const h3_cond_disk *disk, const char *why) {
-    fprintf(stderr, "h3: conditioning disk cache: discarding %s (%s); "
-                    "recomputing\n", disk->path, why);
-    unlink(disk->path);
+/* Is the restored conditioning what this request's encoders would produce?
+ * NULL when it is, else the reason. */
+static const char *h3cc_validate(const h3_cond_disk *disk,
+                                 const h3cc_header *header,
+                                 const uint8_t *tags,
+                                 const h3_layout_ref *references) {
+    if (header->width != H3_COND_TEXT_WIDTH || !header->tokens)
+        return "text shape";
+    if ((header->has_tags != 0) != (disk->expect_tags != 0))
+        return "modality tags present / absent";
+    for (uint64_t i = 0; tags && i < header->tokens; i++)
+        if (tags[i] > 2) return "modality tag value";
+    if ((header->conditioned != 0) != (disk->expect_conditioned != 0))
+        return "conditioned flag";
+    if (header->reference_count != disk->expect_references)
+        return "reference count";
+    if (!disk->ref2va) {
+        if (header->video_elements != disk->expect_video_elements ||
+            header->audio_elements) return "keyframe rows";
+        return NULL;
+    }
+    uint64_t video = 0, audio = 0;
+    for (uint64_t i = 0; i < header->reference_count; i++) {
+        const h3_layout_ref *r = &references[i];
+        if ((int)r->kind != disk->expect_kinds[i]) return "reference kind";
+        if (r->audio_t < 0 || r->audio_t > H3CC_MAX_AUDIO_T)
+            return "reference audio length";
+        if (r->kind == H3_LAYOUT_REF_AUDIO) {
+            if (r->latent_t || r->latent_h || r->latent_w || r->audio_t < 1)
+                return "audio reference geometry";
+        } else {
+            if (r->latent_t < 1 || r->latent_h < 1 || r->latent_w < 1 ||
+                r->latent_t > H3CC_MAX_LATENT || r->latent_h > H3CC_MAX_LATENT ||
+                r->latent_w > H3CC_MAX_LATENT ||
+                (r->kind == H3_LAYOUT_REF_IMAGE && r->audio_t))
+                return "visual reference geometry";
+            uint64_t span = (uint64_t)r->latent_t * (uint64_t)r->latent_h *
+                            (uint64_t)r->latent_w / 4 * 96;
+            if (__builtin_add_overflow(video, span, &video))
+                return "reference rows";
+        }
+        if (__builtin_add_overflow(audio, (uint64_t)r->audio_t * 64, &audio))
+            return "reference audio rows";
+    }
+    if (video != header->video_elements || audio != header->audio_elements)
+        return "reference rows";
+    return NULL;
+}
+
+/* Remove a corrupt / inconsistent entry, but only if the path still names
+ * the file that was read (another writer may have renamed a new one in). */
+static void h3cc_drop(const h3_cond_disk *disk, const struct stat *read,
+                      const char *why) {
+    struct stat now;
+    int same = lstat(disk->path, &now) == 0 && now.st_dev == read->st_dev &&
+               now.st_ino == read->st_ino;
+    fprintf(stderr, "h3: conditioning disk cache: %s %s (%s); recomputing\n",
+            same ? "discarding" : "ignoring", disk->path, why);
+    if (same) unlink(disk->path);
+}
+
+static void h3cc_miss(const char *path, const char *why) {
+    fprintf(stderr, "h3: conditioning disk cache: not using %s (%s); "
+                    "recomputing\n", path, why);
 }
 
 int h3_cond_disk_load(const h3_cond_disk *disk, h3_text_embedding *text,
@@ -415,86 +575,118 @@ int h3_cond_disk_load(const h3_cond_disk *disk, h3_text_embedding *text,
     *audio = NULL;
     *references = NULL;
     *video_elements = *audio_elements = *reference_count = 0;
-    int fd = open(disk->path, O_RDONLY);
-    if (fd < 0) return 0;
+    *conditioned = 0;
+    int fd = open(disk->path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno != ENOENT) h3cc_miss(disk->path, strerror(errno));
+        return 0;
+    }
     struct stat status;
     unsigned char *data = NULL;
-    const char *why = NULL;
-    if (fstat(fd, &status) != 0 || status.st_size < (off_t)sizeof(h3cc_header) ||
-        (uint64_t)status.st_size > disk->max_bytes + (1ull << 20)) {
-        why = "bad size";
-        goto failed;
+    h3_layout_ref *refs = NULL;
+    const char *corrupt = NULL;     /* content problem: drop the entry */
+    const char *transient = NULL;   /* leave the file alone */
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)) {
+        transient = "not a regular file";
+        goto done;
+    }
+    if (status.st_size < (off_t)sizeof(h3cc_header)) {
+        corrupt = "too small";
+        goto done;
+    }
+    if ((uint64_t)status.st_size > disk->max_bytes) {
+        transient = "larger than the cache limit";
+        goto done;
     }
     size_t size = (size_t)status.st_size;
     data = malloc(size);
     if (!data) {
-        why = "out of memory";
-        goto failed;
+        transient = "out of memory";
+        goto done;
     }
-    size_t done = 0;
-    while (done < size) {
-        ssize_t got = read(fd, data + done, size - done);
+    size_t done_bytes = 0;
+    while (done_bytes < size) {
+        ssize_t got = read(fd, data + done_bytes, size - done_bytes);
+        if (got < 0 && errno == EINTR) continue;
         if (got <= 0) {
-            why = "short read";
-            goto failed;
+            transient = got < 0 ? "read error" : "file changed while reading";
+            goto done;
         }
-        done += (size_t)got;
+        done_bytes += (size_t)got;
     }
     h3cc_header header;
     memcpy(&header, data, sizeof(header));
-    uint64_t payload_bytes = 0;
+    uint64_t payload_bytes = 0, total = 0;
     size_t key_length = strlen(disk->key);
     if (memcmp(header.magic, H3CC_MAGIC, 8) || header.version != H3CC_VERSION ||
         header.header_bytes != sizeof(header)) {
-        why = "bad magic or version";
-        goto failed;
+        corrupt = "bad magic or version";
+        goto done;
     }
     if (!h3cc_sizes(&header, &payload_bytes) ||
         payload_bytes != header.payload_bytes ||
         header.key_bytes != key_length ||
-        sizeof(header) + header.key_bytes + header.payload_bytes != size ||
-        !header.tokens || !header.width) {
-        why = "inconsistent sizes";
-        goto failed;
+        __builtin_add_overflow((uint64_t)sizeof(header), header.key_bytes, &total) ||
+        __builtin_add_overflow(total, header.payload_bytes, &total) ||
+        total != size) {
+        corrupt = "inconsistent sizes";
+        goto done;
     }
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     const unsigned char *key_bytes = data + sizeof(header);
     const unsigned char *payload = key_bytes + header.key_bytes;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     if (memcmp(key_bytes, disk->key, key_length)) {
-        why = "different key";
-        goto failed;
+        corrupt = "different key";
+        goto done;
     }
     h3cc_sha(key_bytes, key_length, digest);
     if (memcmp(digest, header.key_sha, sizeof(digest))) {
-        why = "key hash mismatch";
-        goto failed;
+        corrupt = "key hash mismatch";
+        goto done;
     }
-    h3cc_sha(payload, (size_t)header.payload_bytes, digest);
-    if (memcmp(digest, header.payload_sha, sizeof(digest))) {
-        why = "payload hash mismatch";
-        goto failed;
+    h3cc_entry_sha(&header, key_bytes, payload, digest);
+    if (memcmp(digest, header.entry_sha, sizeof(digest))) {
+        corrupt = "entry hash mismatch";
+        goto done;
     }
     size_t values_bytes = (size_t)(header.tokens * header.width * 2);
+    const unsigned char *tags = header.has_tags ? payload + values_bytes : NULL;
+    const unsigned char *cursor = payload + values_bytes +
+        (header.has_tags ? header.tokens : 0) +
+        header.video_elements * sizeof(float) +
+        header.audio_elements * sizeof(float);
+    if (header.reference_count) {
+        refs = calloc((size_t)header.reference_count, sizeof(*refs));
+        if (!refs) {
+            transient = "out of memory";
+            goto done;
+        }
+        for (uint64_t i = 0; i < header.reference_count; i++) {
+            int32_t fields[5];
+            memcpy(fields, cursor, sizeof(fields));
+            cursor += sizeof(fields);
+            refs[i] = (h3_layout_ref){(h3_layout_ref_kind)fields[0], fields[1],
+                                      fields[2], fields[3], fields[4]};
+        }
+    }
+    corrupt = h3cc_validate(disk, &header, tags, refs);
+    if (corrupt) goto done;
     text->values = malloc(values_bytes);
-    if (header.has_tags) text->tags = malloc((size_t)header.tokens);
+    if (tags) text->tags = malloc((size_t)header.tokens);
     if (header.video_elements)
         *video = malloc((size_t)header.video_elements * sizeof(float));
     if (header.audio_elements)
         *audio = malloc((size_t)header.audio_elements * sizeof(float));
-    if (header.reference_count)
-        *references = calloc((size_t)header.reference_count,
-                             sizeof(**references));
-    if (!text->values || (header.has_tags && !text->tags) ||
+    if (!text->values || (tags && !text->tags) ||
         (header.video_elements && !*video) ||
-        (header.audio_elements && !*audio) ||
-        (header.reference_count && !*references)) {
-        why = "out of memory";
-        goto failed_outputs;
+        (header.audio_elements && !*audio)) {
+        transient = "out of memory";
+        goto done;
     }
-    const unsigned char *cursor = payload;
+    cursor = payload;
     memcpy(text->values, cursor, values_bytes);
     cursor += values_bytes;
-    if (header.has_tags) {
+    if (tags) {
         memcpy(text->tags, cursor, (size_t)header.tokens);
         cursor += header.tokens;
     }
@@ -503,37 +695,30 @@ int h3_cond_disk_load(const h3_cond_disk *disk, h3_text_embedding *text,
     cursor += header.video_elements * sizeof(float);
     if (header.audio_elements)
         memcpy(*audio, cursor, (size_t)header.audio_elements * sizeof(float));
-    cursor += header.audio_elements * sizeof(float);
-    for (uint64_t i = 0; i < header.reference_count; i++) {
-        int32_t fields[5];
-        memcpy(fields, cursor, sizeof(fields));
-        cursor += sizeof(fields);
-        (*references)[i] = (h3_layout_ref){(h3_layout_ref_kind)fields[0],
-                                           fields[1], fields[2], fields[3],
-                                           fields[4]};
-    }
     text->tokens = (size_t)header.tokens;
     text->width = (size_t)header.width;
     *video_elements = (size_t)header.video_elements;
     *audio_elements = (size_t)header.audio_elements;
     *reference_count = (size_t)header.reference_count;
+    *references = refs;
     *conditioned = (int)header.conditioned;
     free(data);
     futimes(fd, NULL);   /* LRU: a hit makes the entry the newest */
     close(fd);
     return 1;
-failed_outputs:
+done:
     h3_text_embedding_free(text);
+    memset(text, 0, sizeof(*text));
     free(*video);
     free(*audio);
-    free(*references);
     *video = NULL;
     *audio = NULL;
-    *references = NULL;
-failed:
+    *video_elements = *audio_elements = 0;
+    free(refs);
     free(data);
+    if (corrupt) h3cc_drop(disk, &status, corrupt);
+    else if (transient) h3cc_miss(disk->path, transient);
     close(fd);
-    if (why) h3cc_drop(disk, why);
     return 0;
 }
 
@@ -568,7 +753,8 @@ static void h3cc_evict(const h3_cond_disk *disk, const char *keep_path) {
         int temporary = !strncmp(item->d_name, ".tmp-", 5);
         if (!entry && !temporary) continue;
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", disk->directory, item->d_name);
+        if (!h3cc_format(path, sizeof(path), "%s/%s", disk->directory,
+                         item->d_name)) continue;
         struct stat status;
         if (lstat(path, &status) != 0 || !S_ISREG(status.st_mode)) continue;
         if (temporary) {
@@ -589,7 +775,7 @@ static void h3cc_evict(const h3_cond_disk *disk, const char *keep_path) {
         count++;
     }
     closedir(dir);
-    qsort(entries, count, sizeof(*entries), h3cc_older);
+    if (count) qsort(entries, count, sizeof(*entries), h3cc_older);
     for (size_t i = 0; i < count && total > disk->max_bytes; i++) {
         if (keep_path && !strcmp(entries[i].path, keep_path)) continue;
         if (unlink(entries[i].path) == 0) total -= (uint64_t)entries[i].size;
@@ -632,8 +818,10 @@ int h3_cond_disk_store(const h3_cond_disk *disk,
     header.reference_count = reference_count;
     header.conditioned = (uint32_t)(conditioned != 0);
     header.has_tags = text->tags != NULL;
-    if (!h3cc_sizes(&header, &header.payload_bytes)) return 0;
-    uint64_t total = sizeof(header) + header.key_bytes + header.payload_bytes;
+    uint64_t total;
+    if (!h3cc_sizes(&header, &header.payload_bytes) ||
+        __builtin_add_overflow((uint64_t)sizeof(header), header.key_bytes, &total) ||
+        __builtin_add_overflow(total, header.payload_bytes, &total)) return 0;
     if (total > disk->max_bytes) {
         fprintf(stderr, "h3: conditioning disk cache: entry of %llu bytes "
                         "exceeds the cache size; not stored\n",
@@ -662,29 +850,41 @@ int h3_cond_disk_store(const h3_cond_disk *disk,
         cursor += sizeof(fields);
     }
     h3cc_sha(disk->key, (size_t)header.key_bytes, header.key_sha);
-    h3cc_sha(payload, (size_t)header.payload_bytes, header.payload_sha);
+    h3cc_entry_sha(&header, disk->key, payload, header.entry_sha);
 
     size_t temporary_size = strlen(disk->directory) + 64;
     char *temporary = malloc(temporary_size);
-    if (!temporary) {
+    if (!temporary || !h3cc_format(temporary, temporary_size, "%s/.tmp-%d-%08x",
+                                   disk->directory, (int)getpid(),
+                                   arc4random())) {
+        free(temporary);
         free(payload);
         return 0;
     }
-    snprintf(temporary, temporary_size, "%s/.tmp-%d-%08x", disk->directory,
-             (int)getpid(), arc4random());
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    int ok = fd >= 0 &&
-        h3cc_write_all(fd, &header, sizeof(header)) &&
-        h3cc_write_all(fd, disk->key, (size_t)header.key_bytes) &&
-        h3cc_write_all(fd, payload, (size_t)header.payload_bytes) &&
-        fsync(fd) == 0;
-    if (fd >= 0 && close(fd) != 0) ok = 0;
-    if (ok && rename(temporary, disk->path) != 0) ok = 0;
-    if (!ok) {
-        fprintf(stderr, "h3: conditioning disk cache: cannot write %s: %s\n",
-                disk->path, strerror(errno));
-        unlink(temporary);
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  0600);
+    int ok = 0, error = 0;
+    if (fd < 0) {
+        error = errno;       /* the name may be someone else's: never unlink it */
+    } else {
+        ok = h3cc_write_all(fd, &header, sizeof(header)) &&
+             h3cc_write_all(fd, disk->key, (size_t)header.key_bytes) &&
+             h3cc_write_all(fd, payload, (size_t)header.payload_bytes) &&
+             fsync(fd) == 0;
+        if (!ok) error = errno;
+        if (close(fd) != 0 && ok) {
+            ok = 0;
+            error = errno;
+        }
+        if (ok && rename(temporary, disk->path) != 0) {
+            ok = 0;
+            error = errno;
+        }
+        if (!ok) unlink(temporary);   /* ours: created with O_EXCL above */
     }
+    if (!ok)
+        fprintf(stderr, "h3: conditioning disk cache: cannot write %s: %s\n",
+                disk->path, strerror(error));
     free(temporary);
     free(payload);
     if (ok) h3cc_evict(disk, disk->path);

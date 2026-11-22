@@ -1030,10 +1030,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
     if (!conditioning_hit) {
+        /* FL2VA keyframe rows as the VAE encoder would produce them (the same
+         * span h3_augment_conditions checks), so a hit can be validated. */
+        uint64_t fl2va_video_elements = 0;
+        if (!ref2va && visual_capacity) {
+            int keyframe_latent_w, keyframe_latent_h;
+            h3_latent_canvas(render_width, render_height,
+                             &keyframe_latent_w, &keyframe_latent_h);
+            fl2va_video_elements = (uint64_t)visual_capacity *
+                ((uint64_t)h3_video_encoder_latent_t(1) *
+                 (uint64_t)keyframe_latent_h * (uint64_t)keyframe_latent_w / 4 * 96);
+        }
         h3_cond_disk_inputs disk_inputs = {
             prompt, params, render_width, render_height, ref2va,
             tokenizer_path, text_path, vae_path, audio_vae_path,
-            "h3_shaders.metal", ctx->device.name};
+            "h3_shaders.metal", ctx->device.name, fl2va_video_elements};
         cond_disk_enabled = h3_cond_disk_open(&cond_disk, &disk_inputs);
         if (cond_disk_enabled) {
             size_t cached_reference_count = 0;
@@ -1044,8 +1055,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 &cached_reference_count, &conditioned);
             if (disk_hit &&
                 cached_reference_count != (ref2va ? params->reference_count : 0)) {
-                h3_set_error(ctx, "cached conditioning has the wrong reference count");
-                goto cleanup;
+                /* Never fail a render because of the cache: recompute. */
+                fprintf(stderr, "h3: conditioning disk cache: reference count "
+                                "mismatch; recomputing\n");
+                h3_text_embedding_free(&text);
+                memset(&text, 0, sizeof(text));
+                free(condition_video_rows); condition_video_rows = NULL;
+                free(condition_audio_rows); condition_audio_rows = NULL;
+                free(layout_references); layout_references = NULL;
+                condition_video_elements = condition_audio_elements = 0;
+                conditioned = 0;
+                disk_hit = 0;
             }
             if (disk_hit && ctx->cache_enabled &&
                 !h3_conditioning_cache_store(
