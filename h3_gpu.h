@@ -543,6 +543,30 @@ int h3_gpu_linear_bf16_weight_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                                   const h3_gpu_tensor *bias,
                                   h3_gpu_tensor *scratch, uint32_t rows,
                                   uint32_t input_dim, uint32_t output_dim);
+/* The same linear on a BF16 input [padded rows][input_dim] (whole 128-row
+ * tiles readable): no F32 -> BF16 pass. */
+int h3_gpu_linear_bf16_input_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *bias, uint32_t rows,
+                                 uint32_t input_dim, uint32_t output_dim);
+/* Track B fused video VAE ops, bit-identical to the F32 kernel followed by
+ * h3_gpu_cast_f32_to_bf16 (tests/bitexact_vae_ops.c). */
+int h3_gpu_rms_norm_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight, uint32_t rows,
+                                uint32_t width, float epsilon);
+int h3_gpu_swiglu_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *fused, uint32_t rows,
+                              uint32_t width);
+int h3_gpu_video_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                               h3_gpu_tensor *key, h3_gpu_tensor *value,
+                               const h3_gpu_tensor *qkv,
+                               const h3_gpu_tensor *rope_cos,
+                               const h3_gpu_tensor *rope_sin,
+                               uint32_t sequence, uint32_t heads,
+                               uint32_t head_dim, uint32_t rope_half,
+                               float epsilon);
 /* Tests and benches: the next SDPA call reads head-major [head,row,dim]
  * Q/K/V, as after the fused QKV projection. */
 void h3_gpu_declare_head_major_sdpa_inputs(h3_gpu *gpu);
