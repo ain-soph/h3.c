@@ -334,6 +334,67 @@ static void h3_debug_hash(const char *label, size_t index, const void *data,
             (unsigned long long)hash, bytes);
 }
 
+/* Track B test hooks (all off by default; they never change what is computed):
+ *   H3_VAE_LATENT_OUT=FILE   write the latent handed to the video VAE decoder
+ *   H3_VAE_LATENT_IN=FILE    decode that latent instead of running the DiT
+ *                            (no audio, no MP4; isolates the decoder)
+ *   H3_VAE_RGB_OUT=FILE      write the decoded F32 RGB frames
+ *   H3_DUMP_ENC_LATENT=DIR   write each video VAE encoder latent (enc-N.f32)
+ *   H3_STOP_AFTER_ENCODE=1   stop right after the video VAE encoder
+ * Every FILE is raw little-endian F32 with a FILE.txt sidecar holding its
+ * geometry (latents: "T H W" of a [24][T][H][W] tensor; RGB: "F H W" of a
+ * [F][H][W][3] tensor). */
+static int h3_dump_f32(const char *path, const float *values, size_t count,
+                       int a, int b, int c) {
+    FILE *file = fopen(path, "wb");
+    int ok = file && fwrite(values, sizeof(*values), count, file) == count;
+    if (file && fclose(file)) ok = 0;
+    char meta[4096];
+    snprintf(meta, sizeof(meta), "%s.txt", path);
+    file = ok ? fopen(meta, "w") : NULL;
+    if (file) {
+        fprintf(file, "%d %d %d\n", a, b, c);
+        if (fclose(file)) ok = 0;
+    } else {
+        ok = 0;
+    }
+    fprintf(stderr, "h3: %s %s (%d %d %d)\n", ok ? "wrote" : "cannot write",
+            path, a, b, c);
+    return ok;
+}
+
+static float *h3_read_latent_file(h3_ctx *ctx, const char *path, int time,
+                                  int height, int width) {
+    char meta[4096];
+    snprintf(meta, sizeof(meta), "%s.txt", path);
+    int t = 0, h = 0, w = 0;
+    FILE *file = fopen(meta, "r");
+    if (!file || fscanf(file, "%d %d %d", &t, &h, &w) != 3) {
+        if (file) fclose(file);
+        h3_set_error(ctx, "H3_VAE_LATENT_IN: cannot read %s", meta);
+        return NULL;
+    }
+    fclose(file);
+    if (t != time || h != height || w != width) {
+        h3_set_error(ctx, "H3_VAE_LATENT_IN: %s is %dx%dx%d, the request "
+                     "needs %dx%dx%d", path, t, h, w, time, height, width);
+        return NULL;
+    }
+    size_t count = (size_t)24 * (size_t)t * (size_t)h * (size_t)w;
+    float *values = malloc(count * sizeof(*values));
+    file = values ? fopen(path, "rb") : NULL;
+    if (!file || fread(values, sizeof(*values), count, file) != count ||
+        fgetc(file) != EOF) {
+        if (file) fclose(file);
+        free(values);
+        h3_set_error(ctx, "H3_VAE_LATENT_IN: cannot read %zu floats from %s",
+                     count, path);
+        return NULL;
+    }
+    fclose(file);
+    return values;
+}
+
 static int h3_augment_conditions(const h3_params *params, int ref2va,
                                  int render_width, int render_height,
                                  const h3_layout_ref *references,
@@ -903,6 +964,50 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
+/* H3_VAE_LATENT_IN: decode a dumped latent with exactly the call the full
+ * pipeline makes, skipping text, DiT, audio and MP4 (Track B decoder tests). */
+static h3_result *h3_decode_latent_only(h3_ctx *ctx, const char *path,
+                                        int ref2va, int video_t, int latent_h,
+                                        int latent_w,
+                                        h3_generation_progress *progress) {
+    char *vae_path = h3_path(ctx->model_dir, ref2va ?
+        "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
+    float *video = vae_path ?
+        h3_read_latent_file(ctx, path, video_t, latent_h, latent_w) : NULL;
+    h3_video_frames frames;
+    memset(&frames, 0, sizeof(frames));
+    h3_result *result = NULL;
+    char detail[512];
+    if (!vae_path) h3_set_error(ctx, "out of memory resolving video VAE path");
+    if (video && !h3_video_vae_decode(
+            vae_path, "h3_shaders.metal", video, video_t, latent_h, latent_w,
+            h3_vae_progress_bridge, progress, &frames, detail,
+            sizeof(detail)))
+        h3_set_error(ctx, "%s", detail);
+    else if (video) {
+        size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
+                           (size_t)frames.width * 3;
+        h3_debug_hash("frames", 0, frames.rgb, rgb_count * sizeof(float));
+        const char *rgb_out = getenv("H3_VAE_RGB_OUT");
+        int ok = !rgb_out || !*rgb_out ||
+            h3_dump_f32(rgb_out, frames.rgb, rgb_count, frames.frames,
+                        frames.height, frames.width);
+        result = ok ? calloc(1, sizeof(*result)) : NULL;
+        if (!ok) h3_set_error(ctx, "cannot write H3_VAE_RGB_OUT");
+        else if (!result) h3_set_error(ctx, "out of memory creating result");
+        if (result) {
+            result->width = frames.width;
+            result->height = frames.height;
+            result->frames = frames.frames;
+            result->fps = H3_FPS;
+        }
+    }
+    free(video);
+    free(vae_path);
+    h3_video_frames_free(&frames);
+    return result;
+}
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
@@ -930,6 +1035,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
+    const char *latent_in = getenv("H3_VAE_LATENT_IN");
+    if (latent_in && *latent_in)
+        return h3_decode_latent_only(ctx, latent_in, ref2va, temporal.video_t,
+                                     latent_h, latent_w, &progress);
     h3_tokenizer *tokenizer = NULL;
     uint32_t *ids = NULL;
     size_t token_count = 0;
@@ -1431,6 +1540,20 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_debug_hash("vae-latent", image, latent.values,
                 (size_t)24 * latent.time * latent.height * latent.width *
                 sizeof(float));
+            const char *enc_dir = getenv("H3_DUMP_ENC_LATENT");
+            if (enc_dir && *enc_dir) {
+                char enc_path[4096];
+                snprintf(enc_path, sizeof(enc_path), "%s/enc-%zu.f32",
+                         enc_dir, image);
+                if (!h3_dump_f32(enc_path, latent.values,
+                        (size_t)24 * latent.time * latent.height *
+                        latent.width, latent.time, latent.height,
+                        latent.width)) {
+                    h3_video_latent_free(&latent);
+                    h3_set_error(ctx, "cannot write H3_DUMP_ENC_LATENT");
+                    goto cleanup;
+                }
+            }
             float *rows = condition_video_rows + condition_offset;
             if (!h3_dit_patchify_video(
                     latent.values, 24, image_latent_t,
@@ -1446,6 +1569,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         if (condition_offset != condition_video_elements) {
             h3_set_error(ctx, "visual condition packing size mismatch");
+            goto cleanup;
+        }
+        const char *stop = getenv("H3_STOP_AFTER_ENCODE");
+        if (stop && *stop && strcmp(stop, "0")) {
+            h3_set_error(ctx, "stopped after the video VAE encoder "
+                         "(H3_STOP_AFTER_ENCODE)");
             goto cleanup;
         }
         size_t vision_cursor = 0;
@@ -1753,6 +1882,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    const char *latent_out = getenv("H3_VAE_LATENT_OUT");
+    if (latent_out && *latent_out &&
+        !h3_dump_f32(latent_out, video, (size_t)24 * temporal.video_t *
+                     (size_t)latent_h * (size_t)latent_w, temporal.video_t,
+                     latent_h, latent_w)) {
+        h3_set_error(ctx, "cannot write H3_VAE_LATENT_OUT");
+        goto cleanup;
+    }
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
@@ -1772,6 +1909,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
                        (size_t)frames.width * 3;
     h3_debug_hash("frames", 0, frames.rgb, rgb_count * sizeof(float));
+    const char *rgb_out = getenv("H3_VAE_RGB_OUT");
+    if (rgb_out && *rgb_out &&
+        !h3_dump_f32(rgb_out, frames.rgb, rgb_count, frames.frames,
+                     frames.height, frames.width)) {
+        h3_set_error(ctx, "cannot write H3_VAE_RGB_OUT");
+        goto cleanup;
+    }
     rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
     if (!rgb8) {
         h3_set_error(ctx, "out of memory converting generated RGB frames");
