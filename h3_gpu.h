@@ -99,6 +99,8 @@ int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
                                   const float *values, size_t elements);
 int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
                              size_t elements);
+int h3_gpu_tensor_write_i8(h3_gpu_tensor *tensor, const int8_t *values,
+                           size_t elements);
 int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    size_t destination_offset,
                                    const uint16_t *values, size_t elements);
@@ -375,6 +377,18 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
+/* As above for a weight whose K was rotated by H256 (h3_rot.h): each 256
+ * group of the activation row is rotated before quantization. */
+int h3_gpu_linear_int8_bf16_rotated(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    h3_gpu_tensor *quantized_input,
+                                    h3_gpu_tensor *input_scales,
+                                    const h3_gpu_tensor *input,
+                                    const h3_gpu_tensor *weight,
+                                    const h3_gpu_tensor *weight_scales,
+                                    uint32_t rows, uint32_t input_dim,
+                                    uint32_t output_dim,
+                                    int use_slower_uncached_int8_scales,
+                                    int rotate_input);
 /* Consume SDPA's native [head,row,dimension] BF16 layout without a full
  * BF16 transpose, gathering directly into the projection's row-major int8. */
 int h3_gpu_linear_int8_head_major_bf16(
@@ -385,7 +399,11 @@ int h3_gpu_linear_int8_head_major_bf16(
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t heads,
-                            uint32_t head_dim, uint32_t output_dim);
+                            uint32_t head_dim, uint32_t output_dim,
+                            int rotate_input);
+/* h3_gpu_mlp_int8_bf16 rotate bits (weights K-rotated by H256, h3_rot.h). */
+#define H3_GPU_ROTATE_FC1_INPUT 1u
+#define H3_GPU_ROTATE_FC2_INPUT 2u
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,
@@ -402,7 +420,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_grouped_quantizer,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
-                         int input_is_quantized);
+                         int input_is_quantized,
+                         unsigned rotate);
 /* Multiply each 256-wide group of every row by the ConvRot Hadamard matrix
  * (input of a linear whose INT8 weights were quantized in the rotated basis). */
 int h3_gpu_rotate256_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -491,7 +510,7 @@ int h3_gpu_gate_adaln_quantize_int8(
                      const h3_gpu_tensor *row_map, uint32_t rows,
                      uint32_t padded_rows, uint32_t width, uint32_t slots,
                      uint32_t gate_slot, uint32_t shift_slot,
-                     uint32_t scale_slot, float epsilon);
+                     uint32_t scale_slot, float epsilon, int rotate);
 int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          h3_gpu_tensor *key, h3_gpu_tensor *value,
                          const h3_gpu_tensor *qkv,
@@ -551,7 +570,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int input_is_quantized,
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
-                                 int use_slower_uncached_int8_scales);
+                                 int use_slower_uncached_int8_scales,
+                                 int rotate_input);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

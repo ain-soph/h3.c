@@ -543,6 +543,11 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
+            [names addObject:@"h3_gate_adaln_quantize_int8_rot256"];
+            [names addObject:@"h3_quantize_bf16_int8_rows_rot256"];
+            [names addObject:
+                @"h3_quantize_bf16_int8_head_major_to_rows_rot256"];
+            [names addObject:@"h3_quantize_bf16_int8_groups1024_rot256"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
@@ -728,8 +733,10 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     /* The BF16 DiT and the packed INT8 DiT (tools/align_int8_pack.py puts every whole-page tensor on a page). */
+    /* Also transformer-int8-<variant>/ packs (e.g. transformer-int8-rot256). */
     int transformer_weight = strstr(path, "/transformer/") != NULL ||
-                             strstr(path, "/transformer-int8/") != NULL;
+                             strstr(path, "/transformer-int8/") != NULL ||
+                             strstr(path, "/transformer-int8-") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
     size_t page = (size_t)getpagesize();
     /* newBufferWithBytesNoCopy needs a page-aligned pointer and a whole number of pages; anything else (unaligned
@@ -1029,6 +1036,15 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
     unsigned char *destination = TENSOR(tensor).buffer.contents;
     memcpy(destination + destination_offset * sizeof(uint16_t), values,
            elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_tensor_write_i8(h3_gpu_tensor *tensor, const int8_t *values,
+                           size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        elements > TENSOR(tensor).elements || !TENSOR(tensor).buffer)
+        return 0;
+    memcpy(TENSOR(tensor).buffer.contents, values, elements);
     return 1;
 }
 
@@ -3575,8 +3591,13 @@ static int h3_gpu_quantize_bf16_int8_rows(
                         h3_gpu_tensor *scales,
                         const h3_gpu_tensor *input, uint32_t rows,
                         uint32_t dispatch_rows, uint32_t columns,
-                        float clip, NSString *label) {
+                        float clip, NSString *label, BOOL rotate) {
     H3GPU *gpu = GPU(opaque);
+    if (rotate && (columns % 256u || columns > 14336u)) {
+        h3_gpu_set_error(gpu, @"rotated int8 quantizer needs K %% 256 == 0 "
+                         "and K <= 14336");
+        return 0;
+    }
     if (!gpu.tensorOpsEnabled || !rows || dispatch_rows < rows || !columns ||
         !h3_gpu_require_bf16(gpu, input, (size_t)rows * columns, label) ||
         !h3_gpu_require_i8(gpu, output,
@@ -3588,7 +3609,8 @@ static int h3_gpu_quantize_bf16_int8_rows(
     BOOL vector_quantizer =
         [label isEqualToString:@"int8 MLP FC2 input"] ||
         getenv("H3_INT8_VECTOR_QUANT");
-    NSString *kernel = vector_quantizer ?
+    NSString *kernel = rotate ? @"h3_quantize_bf16_int8_rows_rot256" :
+        vector_quantizer ?
         @"h3_quantize_bf16_int8_rows" :
         @"h3_quantize_bf16_int8_rows_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
@@ -3620,7 +3642,7 @@ static int h3_gpu_quantize_bf16_int8_head_major_rows(
                         h3_gpu_tensor *scales,
                         const h3_gpu_tensor *input, uint32_t rows,
                         uint32_t padded_rows, uint32_t heads,
-                        uint32_t head_dim) {
+                        uint32_t head_dim, BOOL rotate) {
     H3GPU *gpu = GPU(opaque);
     size_t columns = (size_t)heads * head_dim;
     if (!gpu.tensorOpsEnabled || !rows || padded_rows < rows ||
@@ -3633,7 +3655,8 @@ static int h3_gpu_quantize_bf16_int8_head_major_rows(
                             @"head-major int8 quantization scales") ||
         !h3_gpu_require_command(gpu)) return 0;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_quantize_bf16_int8_head_major_to_rows_cached");
+        gpu, rotate ? @"h3_quantize_bf16_int8_head_major_to_rows_rot256" :
+                      @"h3_quantize_bf16_int8_head_major_to_rows_cached");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
         h3_gpu_set_error(
             gpu, @"device cannot dispatch M5 head-major int8 quantizer");
@@ -3666,9 +3689,14 @@ static int h3_gpu_quantize_bf16_int8_groups(
                         const h3_gpu_tensor *input, uint32_t rows,
                         uint32_t dispatch_rows, uint32_t columns,
                         uint32_t group_size,
-                        int use_slower_grouped_quantizer) {
+                        int use_slower_grouped_quantizer, BOOL rotate) {
     H3GPU *gpu = GPU(opaque);
     if (!group_size || (group_size % 4)) return 0;
+    if (rotate && group_size != 1024u) {
+        h3_gpu_set_error(gpu, @"rotated grouped int8 quantizer needs "
+                         "1024-wide groups");
+        return 0;
+    }
     uint32_t groups = (columns + group_size - 1) / group_size;
     if (!gpu.tensorOpsEnabled || !rows || dispatch_rows < rows || !columns ||
         (columns % group_size) ||
@@ -3690,7 +3718,9 @@ static int h3_gpu_quantize_bf16_int8_groups(
     if (cache_override)
         cached128 = cached128 && *cache_override &&
             strcmp(cache_override, "0");
-    NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
+    if (rotate) scalar128 = NO;
+    NSString *kernel = rotate ? @"h3_quantize_bf16_int8_groups1024_rot256" :
+        getenv("H3_INT8_VECTOR_QUANT") ?
         @"h3_quantize_bf16_int8_groups" : cached128 ?
         @"h3_quantize_bf16_int8_groups_scalar128_cached" : scalar128 ?
         @"h3_quantize_bf16_int8_groups_scalar128" :
@@ -3729,7 +3759,7 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
                                 uint32_t columns) {
     return h3_gpu_quantize_bf16_int8_rows(
         opaque, output, scales, input, rows, rows, columns,
-        1.0f, @"BF16 weight to quantize");
+        1.0f, @"BF16 weight to quantize", NO);
 }
 
 static int h3_gpu_linear_int8_bf16_layout(
@@ -3743,7 +3773,7 @@ static int h3_gpu_linear_int8_bf16_layout(
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales,
                             BOOL headMajorInput, uint32_t heads,
-                            uint32_t headDim) {
+                            uint32_t headDim, BOOL rotate) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
     /* Fewer than 128 rows (Qwen text prompts) work too: the quantizer
@@ -3761,11 +3791,11 @@ static int h3_gpu_linear_int8_bf16_layout(
         if (use_slower_uncached_int8_scales || heads * headDim != input_dim ||
             !h3_gpu_quantize_bf16_int8_head_major_rows(
                 opaque, quantized_input, input_scales, input, rows,
-                padded_rows, heads, headDim)) return 0;
+                padded_rows, heads, headDim, rotate)) return 0;
     } else if (!h3_gpu_quantize_bf16_int8_rows(
                    opaque, quantized_input, input_scales, input, rows,
                    padded_rows, input_dim, 1.0f,
-                   @"int8 linear input")) return 0;
+                   @"int8 linear input", rotate)) return 0;
     BOOL local_scales = !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
     BOOL known_linear = local_scales && rows <= 2048 && input_dim == 7168 &&
@@ -3814,7 +3844,23 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, rows, input_dim, output_dim,
-        use_slower_uncached_int8_scales, NO, 0, 0);
+        use_slower_uncached_int8_scales, NO, 0, 0, NO);
+}
+
+int h3_gpu_linear_int8_bf16_rotated(h3_gpu *opaque, h3_gpu_tensor *output,
+                                    h3_gpu_tensor *quantized_input,
+                                    h3_gpu_tensor *input_scales,
+                                    const h3_gpu_tensor *input,
+                                    const h3_gpu_tensor *weight,
+                                    const h3_gpu_tensor *weight_scales,
+                                    uint32_t rows, uint32_t input_dim,
+                                    uint32_t output_dim,
+                                    int use_slower_uncached_int8_scales,
+                                    int rotate_input) {
+    return h3_gpu_linear_int8_bf16_layout(
+        opaque, output, quantized_input, input_scales, input, weight,
+        weight_scales, rows, input_dim, output_dim,
+        use_slower_uncached_int8_scales, NO, 0, 0, rotate_input != 0);
 }
 
 int h3_gpu_linear_int8_head_major_bf16(
@@ -3825,11 +3871,12 @@ int h3_gpu_linear_int8_head_major_bf16(
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t heads,
-                            uint32_t head_dim, uint32_t output_dim) {
+                            uint32_t head_dim, uint32_t output_dim,
+                            int rotate_input) {
     return h3_gpu_linear_int8_bf16_layout(
         opaque, output, quantized_input, input_scales, input, weight,
         weight_scales, rows, heads * head_dim, output_dim, 0, YES, heads,
-        head_dim);
+        head_dim, rotate_input != 0);
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -3848,9 +3895,12 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          int use_slower_grouped_quantizer,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
-                         int input_is_quantized) {
+                         int input_is_quantized,
+                         unsigned rotate) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
+    BOOL rotate_fc1 = (rotate & H3_GPU_ROTATE_FC1_INPUT) != 0;
+    BOOL rotate_fc2 = (rotate & H3_GPU_ROTATE_FC2_INPUT) != 0;
     uint32_t fc2_scale_groups = hidden_dim / 1024u;
     size_t activation_capacity = (size_t)padded_rows *
         MAX(input_dim, hidden_dim);
@@ -3962,7 +4012,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, input, rows,
             padded_rows, input_dim, activation_clip,
-            @"int8 MLP input")) return 0;
+            @"int8 MLP input", rotate_fc1)) return 0;
     if (int8_fc1) @autoreleasepool {
         linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
@@ -3997,12 +4047,12 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_quantize_bf16_int8_groups(
             opaque, quantized_activation, activation_scales, activated, rows,
             padded_rows, hidden_dim, 1024,
-            use_slower_grouped_quantizer)) return 0;
+            use_slower_grouped_quantizer, rotate_fc2)) return 0;
     if (int8_fc2 && !grouped_fc2 &&
         !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, activated, rows,
             padded_rows, hidden_dim, activation_clip,
-            @"int8 MLP FC2 input")) return 0;
+            @"int8 MLP FC2 input", rotate_fc2)) return 0;
     if (int8_fc2) @autoreleasepool {
         linear_args fc2_args = {rows, hidden_dim, output_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
@@ -4454,8 +4504,12 @@ int h3_gpu_gate_adaln_quantize_int8(
                      const h3_gpu_tensor *row_map, uint32_t rows,
                      uint32_t padded_rows, uint32_t width, uint32_t slots,
                      uint32_t gate_slot, uint32_t shift_slot,
-                     uint32_t scale_slot, float epsilon) {
+                     uint32_t scale_slot, float epsilon, int rotate) {
     H3GPU *gpu = GPU(opaque);
+    if (rotate && width != 5376u) {
+        h3_gpu_set_error(gpu, @"rotated fused int8 AdaLN needs width 5376");
+        return 0;
+    }
     size_t elements = (size_t)rows * width;
     size_t padded_elements = (size_t)padded_rows * width;
     if (!gpu.tensorOpsEnabled || !rows || padded_rows < rows || !width ||
@@ -4488,7 +4542,8 @@ int h3_gpu_gate_adaln_quantize_int8(
     gate_adaln_args args = {
         rows, width, slots, gate_slot, shift_slot, scale_slot, epsilon
     };
-    NSString *pipeline_name = width == 5376 &&
+    NSString *pipeline_name = rotate ? @"h3_gate_adaln_quantize_int8_rot256" :
+        width == 5376 &&
         getenv("H3_DISABLE_VECTOR_GATE_ADALN") == NULL ?
         @"h3_gate_adaln_quantize_int8" :
         @"h3_gate_adaln_quantize_int8_scalar";
@@ -4752,7 +4807,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int input_is_quantized,
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
-                                 int use_slower_uncached_int8_scales) {
+                                 int use_slower_uncached_int8_scales,
+                                 int rotate_input) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -4786,7 +4842,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         !h3_gpu_require_command(gpu)) return 0;
     if (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
-            input_dim, 1.0f, @"int8 QKV input")) return 0;
+            input_dim, 1.0f, @"int8 QKV input", rotate_input != 0)) return 0;
     BOOL fused_rope = !use_slower_unfused_qkv_rope &&
         getenv("H3_DISABLE_FUSED_INT8_QKV_ROPE") == NULL;
     BOOL local_scales = fused_rope && rows > 2048 &&
