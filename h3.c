@@ -1,5 +1,6 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
+#include "h3_cond_cache.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
@@ -972,6 +973,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *prepared_key = NULL;
     char *decoder_key = NULL;
     int conditioning_hit = 0;
+    int disk_hit = 0;
+    h3_cond_disk cond_disk;
+    int cond_disk_enabled = 0;
+    memset(&cond_disk, 0, sizeof(cond_disk));
     int conditioned = 0;
     int dit_is_cached = 0;
     int decoder_is_cached = 0;
@@ -1024,13 +1029,40 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
-    if (conditioning_hit) {
-        size_t cached_reference_count = 0;
-        if (!h3_conditioning_cache_load(
+    if (!conditioning_hit) {
+        h3_cond_disk_inputs disk_inputs = {
+            prompt, params, render_width, render_height, ref2va,
+            tokenizer_path, text_path, vae_path, audio_vae_path,
+            "h3_shaders.metal", ctx->device.name};
+        cond_disk_enabled = h3_cond_disk_open(&cond_disk, &disk_inputs);
+        if (cond_disk_enabled) {
+            size_t cached_reference_count = 0;
+            disk_hit = h3_cond_disk_load(
+                &cond_disk, &text, &condition_video_rows,
+                &condition_video_elements, &condition_audio_rows,
+                &condition_audio_elements, &layout_references,
+                &cached_reference_count, &conditioned);
+            if (disk_hit &&
+                cached_reference_count != (ref2va ? params->reference_count : 0)) {
+                h3_set_error(ctx, "cached conditioning has the wrong reference count");
+                goto cleanup;
+            }
+            if (disk_hit && ctx->cache_enabled &&
+                !h3_conditioning_cache_store(
+                    ctx, conditioning_key, &text,
+                    condition_video_rows, condition_video_elements,
+                    condition_audio_rows, condition_audio_elements,
+                    layout_references, cached_reference_count, conditioned))
+                fprintf(stderr, "h3: warning: could not retain conditioning cache\n");
+        }
+    }
+    if (conditioning_hit || disk_hit) {
+        size_t cached_reference_count = ref2va ? params->reference_count : 0;
+        if (conditioning_hit && (!h3_conditioning_cache_load(
                 ctx, &text, &condition_video_rows, &condition_video_elements,
                 &condition_audio_rows, &condition_audio_elements,
                 &layout_references, &cached_reference_count, &conditioned) ||
-            cached_reference_count != (ref2va ? params->reference_count : 0)) {
+            cached_reference_count != (ref2va ? params->reference_count : 0))) {
             h3_set_error(ctx, "cannot restore cached conditioning");
             goto cleanup;
         }
@@ -1039,7 +1071,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (params->last_frame)
                 keyframes[keyframe_count++] = temporal.frame_count - 1;
         }
-        fprintf(stderr, "h3: conditioning cache hit\n");
+        fprintf(stderr, disk_hit ? "h3: conditioning disk cache hit\n" :
+                                   "h3: conditioning cache hit\n");
     } else {
     if (visual_capacity) {
         condition_pixels = calloc(visual_capacity, sizeof(*condition_pixels));
@@ -1510,6 +1543,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         else
             fprintf(stderr, "h3: conditioning cache miss; stored exact BF16\n");
     }
+    if (cond_disk_enabled && !progress.cancelled &&
+        h3_cond_disk_store(&cond_disk, &text,
+                           condition_video_rows, condition_video_elements,
+                           condition_audio_rows, condition_audio_elements,
+                           layout_references,
+                           ref2va ? params->reference_count : 0, conditioned))
+        fprintf(stderr, "h3: conditioning disk cache miss; stored\n");
     }
     if (conditioned && !h3_augment_conditions(
             params, ref2va, render_width, render_height, layout_references,
@@ -1771,6 +1811,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
 
 cleanup:
     free(conditioning_key);
+    h3_cond_disk_close(&cond_disk);
     free(prepared_key);
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
