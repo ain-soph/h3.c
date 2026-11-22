@@ -251,7 +251,10 @@ static int h3cc_env_ignored(const char *entry) {
         "H3_COND_CACHE", "H3_SPARSE=", "H3_ATTN=", "H3_ATTN_VARIANT=",
         "H3_ATTN_STAGE=", "H3_TOKEN_REDUCTION", "H3_DISABLE_TOKEN_REDUCTION=",
         "H3_REUSE_STEPS=", "H3_CPU_SAMPLER=", "H3_GPU_SAMPLER", "H3_DIT_",
-        "H3_PROFILE=", "H3_DEBUG_HASH=", "H3_VIDEO_", "H3_MEDIA_"};
+        "H3_PROFILE=", "H3_DEBUG_HASH=", "H3_VIDEO_", "H3_MEDIA_",
+        /* Track A study outputs / DiT-only inputs (H3_TEXT_EMB_IN/OUT turn
+         * the cache off instead). */
+        "H3_DUMP_LATENTS=", "H3_DUMP_FRAMES=", "H3_TEACHER_FORCE_"};
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(*prefixes); i++)
         if (!strncmp(entry, prefixes[i], strlen(prefixes[i]))) return 1;
     return 0;

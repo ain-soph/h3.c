@@ -37,6 +37,9 @@ h3_sparse_test: tests/test_sparse.o $(LIB_OBJ)
 h3_cond_cache_test: tests/test_cond_cache.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_rot_pack_test: tests/test_rot_pack.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_bench_int8: tests/bench_int8.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

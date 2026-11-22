@@ -732,11 +732,21 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
-    /* The BF16 DiT and the packed INT8 DiT (tools/align_int8_pack.py puts every whole-page tensor on a page). */
-    /* Also transformer-int8-<variant>/ packs (e.g. transformer-int8-rot256). */
-    int transformer_weight = strstr(path, "/transformer/") != NULL ||
-                             strstr(path, "/transformer-int8/") != NULL ||
-                             strstr(path, "/transformer-int8-") != NULL;
+    /* The BF16 DiT and the packed INT8 DiT (tools/align_int8_pack.py puts every whole-page tensor on a page): files
+       directly in a directory named transformer, transformer-int8 or transformer-int8-<variant> (e.g. rot256). */
+    int transformer_weight = 0;
+    {
+        const char *slash = strrchr(path, '/');
+        if (slash) {
+            const char *start = slash;
+            while (start > path && start[-1] != '/') start--;
+            size_t length = (size_t)(slash - start);
+            transformer_weight =
+                (length == 11 && !strncmp(start, "transformer", 11)) ||
+                (length == 16 && !strncmp(start, "transformer-int8", 16)) ||
+                (length > 17 && !strncmp(start, "transformer-int8-", 17));
+        }
+    }
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
     size_t page = (size_t)getpagesize();
     /* newBufferWithBytesNoCopy needs a page-aligned pointer and a whole number of pages; anything else (unaligned

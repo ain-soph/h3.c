@@ -4607,6 +4607,8 @@ kernel void h3_dequantize_int8_rows_bf16(device const char4 *weight [[buffer(0)]
 }
 
 /* ---- Track A: Hadamard-rotated int8 activations (h3_rot.h) ------------- */
+/* bfloat kernels: built only with TensorOps (h3_gpu.m loads them only then). */
+#ifdef H3_METAL_HAS_TENSOR
 
 /* H256 = (H4 / 2)^{(x)4} (the ConvRot matrix of h3_rotate256_bf16) over one
  * 256-wide group held by a simdgroup: lane owns elements 8 lane .. 8 lane + 7
@@ -4963,3 +4965,4 @@ kernel void h3_gate_adaln_quantize_int8_rot256(
                                  v[round], quantize_scale);
     }
 }
+#endif /* H3_METAL_HAS_TENSOR (Track A) */

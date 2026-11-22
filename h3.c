@@ -1,6 +1,7 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
 #include "h3_cond_cache.h"
+#include "h3_rot.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
@@ -164,9 +165,13 @@ failed:
 
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
-                             int render_width, int render_height) {
+                             int render_width, int render_height,
+                             const char *dit_path) {
     h3_key key = {0};
-    if (!h3_key_append(
+    const char *rot = getenv("H3_DIT_ROT");
+    if (!h3_key_append(&key, "dit=%zu:%s|dit-rot=%s|", strlen(dit_path),
+                       dit_path, rot ? rot : "-") ||
+        !h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
@@ -485,19 +490,62 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
 
 /* Prefer the packed INT8 DiT (<variant>/transformer-int8, written by
  * h3_pack_int8) over the BF16 checkpoint. H3_DIT_BF16=1 forces the BF16 one,
- * which is how the two are compared. */
-static const char *h3_dit_relative(const h3_ctx *ctx, int ref2va) {
+ * which is how the two are compared. H3_DIT_VARIANT=NAME selects the FL2VA
+ * pack FL2VA/transformer-int8-NAME of the same model directory instead (e.g.
+ * rot256, the Hadamard-rotated pack); it must exist. Ref2VA keeps its own
+ * pack, and another model directory (e.g. a LoRA-folded one) its own unless
+ * it has that variant too. Writes the relative path into `relative`; returns
+ * 0 with ctx's error set on a bad selection. */
+static int h3_dit_relative(h3_ctx *ctx, int ref2va, char *relative,
+                           size_t size) {
     const char *packed = ref2va ? "Ref2VA/transformer-int8" :
                                   "FL2VA/transformer-int8";
     const char *bf16 = ref2va ? "Ref2VA/transformer" : "FL2VA/transformer";
     const char *forced = getenv("H3_DIT_BF16");
-    if (forced && !strcmp(forced, "1")) return bf16;
-    char relative[64];
-    snprintf(relative, sizeof(relative), "%s/h3-int8-pack.json", packed);
-    char *marker = h3_path(ctx->model_dir, relative);
+    const char *variant = ref2va ? NULL : getenv("H3_DIT_VARIANT");
+    int bf16_forced = forced && !strcmp(forced, "1");
+    if (variant && *variant) {
+        size_t length = strlen(variant);
+        int valid = length <= 32;
+        for (size_t index = 0; valid && index < length; index++) {
+            char c = variant[index];
+            valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '-';
+        }
+        if (!valid) {
+            h3_set_error(ctx, "H3_DIT_VARIANT must be a short name of "
+                              "[A-Za-z0-9_-] (got '%s')", variant);
+            return 0;
+        }
+        if (bf16_forced || (getenv("H3_DIT_DIR") && *getenv("H3_DIT_DIR"))) {
+            h3_set_error(ctx, "H3_DIT_VARIANT cannot be combined with %s",
+                         bf16_forced ? "H3_DIT_BF16=1" : "H3_DIT_DIR");
+            return 0;
+        }
+        snprintf(relative, size, "%s-%s", packed, variant);
+        char marker_relative[96];
+        snprintf(marker_relative, sizeof(marker_relative),
+                 "%s/h3-int8-pack.json", relative);
+        char *marker = h3_path(ctx->model_dir, marker_relative);
+        int exists = marker && h3_is_file(marker);
+        if (!exists)
+            h3_set_error(ctx, "H3_DIT_VARIANT=%s: no packed DiT at %s",
+                         variant, marker ? marker : relative);
+        free(marker);
+        return exists;
+    }
+    if (bf16_forced) {
+        snprintf(relative, size, "%s", bf16);
+        return 1;
+    }
+    char marker_relative[64];
+    snprintf(marker_relative, sizeof(marker_relative), "%s/h3-int8-pack.json",
+             packed);
+    char *marker = h3_path(ctx->model_dir, marker_relative);
     int has_packed = marker && h3_is_file(marker);
     free(marker);
-    return has_packed ? packed : bf16;
+    snprintf(relative, size, "%s", has_packed ? packed : bf16);
+    return 1;
 }
 
 /* Prefer FL2VA/text_encoder-int8 (the H3 image text encoder's INT8 convrot
@@ -533,8 +581,13 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         free(ctx);
         return NULL;
     }
-    const char *fl2va_dit = h3_dit_relative(ctx, 0);
+    char fl2va_dit[80];
     char fl2va_config[96];
+    if (!h3_dit_relative(ctx, 0, fl2va_dit, sizeof(fl2va_dit))) {
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
     snprintf(fl2va_config, sizeof(fl2va_config), "%s/config.json", fl2va_dit);
     if (!h3_require_file(ctx, fl2va_config) ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
@@ -549,7 +602,8 @@ h3_ctx *h3_load_dir(const char *model_dir) {
     }
     /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
      * FL2VA usable while that optional 62 GiB checkpoint is not installed. */
-    const char *ref2va_dit = h3_dit_relative(ctx, 1);
+    char ref2va_dit[80];
+    h3_dit_relative(ctx, 1, ref2va_dit, sizeof(ref2va_dit));
     char ref2va_config[96];
     snprintf(ref2va_config, sizeof(ref2va_config), "%s/config.json",
              ref2va_dit);
@@ -1018,7 +1072,7 @@ static h3_result *h3_decode_latent_only(h3_ctx *ctx, const char *path,
  * H3_DUMP_FRAMES=FILE    final RGB24 frames as delivered (raw) */
 static int h3_text_embedding_save(const char *path,
                                   const h3_text_embedding *text) {
-    FILE *file = fopen(path, "wb");
+    FILE *file = h3_study_fopen(path, 0);
     if (!file) return 0;
     uint64_t header[3] = {text->tokens, text->width, text->tags != NULL};
     size_t count = text->tokens * text->width;
@@ -1027,7 +1081,9 @@ static int h3_text_embedding_save(const char *path,
              fwrite(text->values, sizeof(uint16_t), count, file) == count &&
              (!text->tags ||
               fwrite(text->tags, 1, text->tokens, file) == text->tokens);
-    return fclose(file) == 0 && ok;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) remove(path);
+    return ok;
 }
 
 static int h3_text_embedding_load(const char *path, h3_text_embedding *text) {
@@ -1060,12 +1116,13 @@ static void h3_dump_file(const char *variable, const void *first,
                          size_t second_bytes) {
     const char *path = getenv(variable);
     if (!path || !*path) return;
-    FILE *file = fopen(path, "wb");
+    FILE *file = h3_study_fopen(path, 0);
     int ok = file &&
              fwrite(first, 1, first_bytes, file) == first_bytes &&
              (!second_bytes ||
               fwrite(second, 1, second_bytes, file) == second_bytes);
     if (file && fclose(file) != 0) ok = 0;
+    if (file && !ok) remove(path);
     fprintf(stderr, "h3: %s %s %s\n", variable, ok ? "wrote" : "FAILED", path);
 }
 
@@ -1155,12 +1212,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, h3_text_relative(ctx, ref2va));
     const char *dit_override = ref2va ? NULL : getenv("H3_DIT_DIR");
-    char *dit_path = dit_override && *dit_override ? strdup(dit_override) :
-        h3_path(ctx->model_dir, h3_dit_relative(ctx, ref2va));
+    char dit_relative[80] = "";
+    int dit_selected = (dit_override && *dit_override) ||
+        h3_dit_relative(ctx, ref2va, dit_relative, sizeof(dit_relative));
+    char *dit_path = !dit_selected ? NULL :
+        dit_override && *dit_override ? strdup(dit_override) :
+        h3_path(ctx->model_dir, dit_relative);
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    if (!dit_selected) goto cleanup;   /* error set by h3_dit_relative */
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
@@ -1173,7 +1235,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     prepared_key = h3_prepared_key(
-        conditioning_key, params, render_width, render_height);
+        conditioning_key, params, render_width, render_height, dit_path);
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -1199,7 +1261,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         free(ctx->dit_key);
         ctx->dit_key = NULL;
     }
-    conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
+    /* The Track A text-embedding hooks bypass (IN) or need (OUT) the text
+     * encoder run, and no cache key covers the file's content: they turn
+     * both conditioning caches off. */
+    const char *emb_in = getenv("H3_TEXT_EMB_IN");
+    const char *emb_out = getenv("H3_TEXT_EMB_OUT");
+    int text_hook = (emb_in && *emb_in) || (emb_out && *emb_out);
+    conditioning_hit = !text_hook && ctx->cache_enabled &&
+        ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
     if (!conditioning_hit) {
@@ -1218,12 +1287,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             prompt, params, render_width, render_height, ref2va,
             tokenizer_path, text_path, vae_path, audio_vae_path,
             "h3_shaders.metal", ctx->device.name, fl2va_video_elements};
-        /* The Track A text-embedding hooks bypass (IN) or need (OUT) the text
-         * encoder run; the disk cache key does not cover the file's content,
-         * so they disable the cache. */
-        const char *emb_in = getenv("H3_TEXT_EMB_IN");
-        const char *emb_out = getenv("H3_TEXT_EMB_OUT");
-        int text_hook = (emb_in && *emb_in) || (emb_out && *emb_out);
         if (text_hook && getenv("H3_COND_CACHE_DIR") &&
             *getenv("H3_COND_CACHE_DIR"))
             fprintf(stderr, "h3: conditioning disk cache off "
@@ -1551,6 +1614,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
 
+    if (emb_in && *emb_in && (ref2va || visual_count)) {
+        h3_set_error(ctx, "H3_TEXT_EMB_IN is for text-only FL2VA prompts "
+                          "(this request has keyframes or references)");
+        goto cleanup;
+    }
     if (visual_count) {
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
@@ -1769,7 +1837,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_debug_hash("cond-video", 0, condition_video_rows,
                   condition_video_elements * sizeof(float));
     conditioned = visual_count != 0 || condition_audio_elements != 0;
-    if (ctx->cache_enabled) {
+    if (ctx->cache_enabled && !text_hook) {
         if (!h3_conditioning_cache_store(
                 ctx, conditioning_key, &text,
                 condition_video_rows, condition_video_elements,
