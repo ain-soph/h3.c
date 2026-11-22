@@ -1008,6 +1008,67 @@ static h3_result *h3_decode_latent_only(h3_ctx *ctx, const char *path,
     return result;
 }
 
+/* ---- Track A study hooks (all opt-in, no effect when unset) ------------
+ * H3_DIT_DIR=PATH        FL2VA DiT directory (BF16 checkpoint or a packed
+ *                        transformer-int8[-variant]) instead of the model
+ *                        directory's own; Ref2VA is unaffected.
+ * H3_TEXT_EMB_OUT=FILE   save the prompt's text embedding (T2V only)
+ * H3_TEXT_EMB_IN=FILE    reuse it: no tokenizer/text encoder run
+ * H3_DUMP_LATENTS=FILE   denoised video then audio latent, F32
+ * H3_DUMP_FRAMES=FILE    final RGB24 frames as delivered (raw) */
+static int h3_text_embedding_save(const char *path,
+                                  const h3_text_embedding *text) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    uint64_t header[3] = {text->tokens, text->width, text->tags != NULL};
+    size_t count = text->tokens * text->width;
+    int ok = fwrite("H3TE", 1, 4, file) == 4 &&
+             fwrite(header, sizeof(header), 1, file) == 1 &&
+             fwrite(text->values, sizeof(uint16_t), count, file) == count &&
+             (!text->tags ||
+              fwrite(text->tags, 1, text->tokens, file) == text->tokens);
+    return fclose(file) == 0 && ok;
+}
+
+static int h3_text_embedding_load(const char *path, h3_text_embedding *text) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    char magic[4];
+    uint64_t header[3];
+    int ok = fread(magic, 1, 4, file) == 4 && !memcmp(magic, "H3TE", 4) &&
+             fread(header, sizeof(header), 1, file) == 1 && header[0] &&
+             header[1] && header[0] < (1u << 20) && header[1] < (1u << 16);
+    if (ok) {
+        size_t count = (size_t)header[0] * (size_t)header[1];
+        text->tokens = (size_t)header[0];
+        text->width = (size_t)header[1];
+        text->values = malloc(count * sizeof(uint16_t));
+        text->tags = header[2] ? malloc(text->tokens) : NULL;
+        ok = text->values && (!header[2] || text->tags) &&
+             fread(text->values, sizeof(uint16_t), count, file) == count &&
+             (!header[2] ||
+              fread(text->tags, 1, text->tokens, file) == text->tokens) &&
+             fgetc(file) == EOF;
+    }
+    fclose(file);
+    if (!ok) h3_text_embedding_free(text);
+    return ok;
+}
+
+static void h3_dump_file(const char *variable, const void *first,
+                         size_t first_bytes, const void *second,
+                         size_t second_bytes) {
+    const char *path = getenv(variable);
+    if (!path || !*path) return;
+    FILE *file = fopen(path, "wb");
+    int ok = file &&
+             fwrite(first, 1, first_bytes, file) == first_bytes &&
+             (!second_bytes ||
+              fwrite(second, 1, second_bytes, file) == second_bytes);
+    if (file && fclose(file) != 0) ok = 0;
+    fprintf(stderr, "h3: %s %s %s\n", variable, ok ? "wrote" : "FAILED", path);
+}
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
@@ -1093,7 +1154,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, h3_text_relative(ctx, ref2va));
-    char *dit_path = h3_path(ctx->model_dir, h3_dit_relative(ctx, ref2va));
+    const char *dit_override = ref2va ? NULL : getenv("H3_DIT_DIR");
+    char *dit_path = dit_override && *dit_override ? strdup(dit_override) :
+        h3_path(ctx->model_dir, h3_dit_relative(ctx, ref2va));
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
@@ -1663,6 +1726,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         for (size_t image = 0; image < vision_output_count; image++)
             h3_vision_output_free(&vision_outputs[image]);
+    } else if (getenv("H3_TEXT_EMB_IN") && *getenv("H3_TEXT_EMB_IN")) {
+        if (!h3_text_embedding_load(getenv("H3_TEXT_EMB_IN"), &text)) {
+            h3_set_error(ctx, "cannot read H3_TEXT_EMB_IN %s",
+                         getenv("H3_TEXT_EMB_IN"));
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: text embedding from %s (%zu tokens)\n",
+                getenv("H3_TEXT_EMB_IN"), text.tokens);
     } else {
         if (!h3_tokenizer_encode(tokenizer, prompt, 1, &ids, &token_count,
                                  detail, sizeof(detail))) {
@@ -1679,6 +1750,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     h3_debug_hash("text", 0, text.values, text.tokens * text.width * 2);
+    if (getenv("H3_TEXT_EMB_OUT") && *getenv("H3_TEXT_EMB_OUT")) {
+        int saved = h3_text_embedding_save(getenv("H3_TEXT_EMB_OUT"), &text);
+        fprintf(stderr, "h3: H3_TEXT_EMB_OUT %s %s\n",
+                saved ? "wrote" : "FAILED", getenv("H3_TEXT_EMB_OUT"));
+    }
     h3_debug_hash("cond-video", 0, condition_video_rows,
                   condition_video_elements * sizeof(float));
     conditioned = visual_count != 0 || condition_audio_elements != 0;
@@ -1865,6 +1941,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_video_vae_prefetch_finish(vae_prefetch);
     vae_prefetch = NULL;
     h3_debug_hash("denoised-video", 0, video, video_count * sizeof(*video));
+    h3_dump_file("H3_DUMP_LATENTS", video, video_count * sizeof(*video),
+                 audio, audio_count * sizeof(*audio));
     h3_debug_hash("denoised-audio", 0, audio, audio_count * sizeof(*audio));
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
@@ -1946,6 +2024,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         output_width = params->width;
         output_height = params->height;
     }
+    h3_dump_file("H3_DUMP_FRAMES", rgb8,
+                 (size_t)frames.frames * (size_t)output_width *
+                 (size_t)output_height * 3, NULL, 0);
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
         for (int index = 0; index < frames.frames; index++) {
