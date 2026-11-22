@@ -98,6 +98,7 @@ typedef struct {
      * BF16 GEMM inputs directly and the BF16 SDPA output feeds the output
      * projection without the BF16->F32->BF16 round trip. Bit-identical. */
     int fused;
+    int direct_unpack;      /* B3: unpack straight from the shared buffer */
     h3_gpu_tensor *bf16_input;
     h3_gpu_tensor *bf16_qkvo[4];
     int latent_h;
@@ -780,22 +781,26 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
         return 0;
     }
     size_t projected_count = (size_t)vae->sequence * OUTPUT_PATCH;
-    float *rows = malloc(projected_count * sizeof(*rows));
+    /* B3 reads the (completed) output buffer in place instead of a copy. */
+    const float *direct = vae->direct_unpack ?
+        h3_gpu_tensor_contents_f32(vae->projected) : NULL;
+    float *rows = direct ? NULL : malloc(projected_count * sizeof(*rows));
     int pixel_h = vae->latent_h * 16;
     int pixel_w = vae->latent_w * 16;
     size_t rgb_count = (size_t)frame_count * (size_t)pixel_h *
                        (size_t)pixel_w * 3;
     float *rgb = malloc(rgb_count * sizeof(*rgb));
-    if (!rows || !rgb) {
+    if ((!rows && !direct) || !rgb) {
         free(rows); free(rgb);
         fail(error, error_size, "out of memory unpacking video VAE frames");
         return 0;
     }
-    if (!h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
+    if (!direct && !h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
         free(rows); free(rgb);
         fail(error, error_size, "cannot read video VAE output patches");
         return 0;
     }
+    const float *source = direct ? direct : rows;
     static const float mean[] = {0.485f, 0.456f, 0.406f};
     static const float deviation[] = {0.229f, 0.224f, 0.225f};
     for (int output_frame = 0; output_frame < frame_count; output_frame++) {
@@ -816,7 +821,7 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
                     size_t component = ((((size_t)channel * 4 +
                         (size_t)within_t) * 16 + (size_t)within_y) * 16 +
                         (size_t)within_x);
-                    float value = rows[patch * OUTPUT_PATCH + component] *
+                    float value = source[patch * OUTPUT_PATCH + component] *
                                   deviation[channel] + mean[channel];
                     if (value < 0.0f) value = 0.0f;
                     if (value > 1.0f) value = 1.0f;
@@ -1272,6 +1277,7 @@ static int decode_chunks_pipelined(vae_context *vae,
     };
     float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
     h3_gpu_tensor *saved_latent = vae->latent;
+    vae->direct_unpack = 1;
     int ok = zero && latents[0] && latents[1] && outputs[1] && tiles;
     if (!ok) fail(error, error_size, "cannot allocate pipelined video VAE buffers");
 #define PREPARE(job) do {                                                       \
@@ -1344,6 +1350,7 @@ static int decode_chunks_pipelined(vae_context *vae,
     free(tiles);
     vae->latent = saved_latent;
     vae->projected = outputs[0];
+    vae->direct_unpack = 0;
     h3_gpu_tensor_free(outputs[1]);
     h3_gpu_tensor_free(latents[0]);
     h3_gpu_tensor_free(latents[1]);
