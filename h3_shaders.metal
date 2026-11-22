@@ -4378,3 +4378,361 @@ kernel void h3_dequantize_int8_rows_bf16(device const char4 *weight [[buffer(0)]
     output[gid] = ushort4(h3_f32_to_bf16(value.x), h3_f32_to_bf16(value.y),
                           h3_f32_to_bf16(value.z), h3_f32_to_bf16(value.w));
 }
+
+/* ---- Track A: Hadamard-rotated int8 activations (h3_rot.h) ------------- */
+
+/* H256 = (H4 / 2)^{(x)4} (the ConvRot matrix of h3_rotate256_bf16) over one
+ * 256-wide group held by a simdgroup: lane owns elements 8 lane .. 8 lane + 7
+ * in v[0..7]. Every radix-4 stage is y[a] = (x0 + x1 + x2 + x3 - 2 x[a^3]) / 2.
+ * Index bits: 0-1 in-thread, 2 in-thread + lane bit 0, lane bits 1-2, lane
+ * bits 3-4. Registers and shuffles only: no threadgroup memory or barriers. */
+inline void h3_rot256_simd(thread float *v) {
+    #pragma clang loop unroll(full)
+    for (uint base = 0; base < 8; base += 4) {
+        float x0 = v[base], x1 = v[base + 1], x2 = v[base + 2],
+              x3 = v[base + 3];
+        float sum = x0 + x1 + x2 + x3;
+        v[base] = 0.5f * (sum - 2.0f * x3);
+        v[base + 1] = 0.5f * (sum - 2.0f * x2);
+        v[base + 2] = 0.5f * (sum - 2.0f * x1);
+        v[base + 3] = 0.5f * (sum - 2.0f * x0);
+    }
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < 4; j++) {
+        float a = v[j], b = v[j + 4];
+        float partner_a = simd_shuffle_xor(a, (ushort)1);
+        float partner_b = simd_shuffle_xor(b, (ushort)1);
+        float sum = a + b + partner_a + partner_b;
+        v[j] = 0.5f * (sum - 2.0f * partner_b);
+        v[j + 4] = 0.5f * (sum - 2.0f * partner_a);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort shift = 1; shift <= 3; shift += 2) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 8; j++) {
+            float x = v[j];
+            float x1 = simd_shuffle_xor(x, (ushort)(1u << shift));
+            float x2 = simd_shuffle_xor(x, (ushort)(2u << shift));
+            float x3 = simd_shuffle_xor(x, (ushort)(3u << shift));
+            v[j] = 0.5f * (x + x1 + x2 - x3);
+        }
+    }
+}
+
+inline void h3_rot256_store_int8(device int8_t *output, uint offset,
+                                 thread const float *v, float inverse) {
+    device char4 *output4 = reinterpret_cast<device char4 *>(output + offset);
+    int4 low = int4(rint(float4(v[0], v[1], v[2], v[3]) * inverse));
+    int4 high = int4(rint(float4(v[4], v[5], v[6], v[7]) * inverse));
+    output4[0] = char4(clamp(low, int4(-127), int4(127)));
+    output4[1] = char4(clamp(high, int4(-127), int4(127)));
+}
+
+inline float h3_rot256_abs_max(thread const float *v) {
+    float m = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < 8; j++) m = max(m, fabs(v[j]));
+    return m;
+}
+
+/* Row quantizer for a linear whose INT8 weight K was rotated by H256:
+ * rotate every 256 group in F32 (no BF16 rounding), then the usual symmetric
+ * per-row scale. columns % 256 == 0, at most 14336 (7 groups per simdgroup). */
+kernel void h3_quantize_bf16_int8_rows_rot256(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint MAX_ROUNDS = 7;
+    uint groups = args.columns / 256u;
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        device char4 *output4 = reinterpret_cast<device char4 *>(output);
+        for (uint column = tid; column < args.columns / 4; column += 256)
+            output4[base / 4 + column] = char4(0);
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    float v[MAX_ROUNDS][8];
+    float local_max = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < groups) {
+            device const bfloat4 *source =
+                reinterpret_cast<device const bfloat4 *>(
+                    input + base + group * 256u + lane * 8u);
+            float4 low = float4(source[0]);
+            float4 high = float4(source[1]);
+            v[round][0] = low.x; v[round][1] = low.y;
+            v[round][2] = low.z; v[round][3] = low.w;
+            v[round][4] = high.x; v[round][5] = high.y;
+            v[round][6] = high.z; v[round][7] = high.w;
+            h3_rot256_simd(v[round]);
+            local_max = max(local_max, h3_rot256_abs_max(v[round]));
+        }
+    }
+    float max_abs = h3_int8_reduce_max(local_max, scratch, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < groups)
+            h3_rot256_store_int8(output, base + group * 256u + lane * 8u,
+                                 v[round], inverse);
+    }
+}
+
+/* Head-major SDPA output (56 heads x 128) to rotated row-major int8: each
+ * 256 group is a pair of heads for this row. */
+kernel void h3_quantize_bf16_int8_head_major_to_rows_rot256(
+                           device const bfloat4 *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_head_major_quant_args &args
+                               [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW = 56u * 128u;
+    constexpr uint GROUPS = ROW / 256u;
+    constexpr uint MAX_ROUNDS = (GROUPS + 7u) / 8u;
+    if (row >= args.rows) {
+        device char4 *output4 = reinterpret_cast<device char4 *>(output);
+        for (uint column = tid; column < ROW / 4u; column += 256)
+            output4[row * (ROW / 4u) + column] = char4(0);
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    float v[MAX_ROUNDS][8];
+    float local_max = 0.0f;
+    uint head_in_pair = lane >> 4;
+    uint vector = (lane & 15u) * 2u;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < GROUPS) {
+            uint head = group * 2u + head_in_pair;
+            uint source = (head * args.rows + row) * 32u + vector;
+            float4 low = float4(input[source]);
+            float4 high = float4(input[source + 1u]);
+            v[round][0] = low.x; v[round][1] = low.y;
+            v[round][2] = low.z; v[round][3] = low.w;
+            v[round][4] = high.x; v[round][5] = high.y;
+            v[round][6] = high.z; v[round][7] = high.w;
+            h3_rot256_simd(v[round]);
+            local_max = max(local_max, h3_rot256_abs_max(v[round]));
+        }
+    }
+    float max_abs = h3_int8_reduce_max(local_max, scratch, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < GROUPS)
+            h3_rot256_store_int8(output, row * ROW + group * 256u + lane * 8u,
+                                 v[round], inverse);
+    }
+}
+
+/* FC2 input with 1024-wide scale groups (four 256 rotation groups each):
+ * eight simdgroups cover two scale groups per round. */
+kernel void h3_quantize_bf16_int8_groups1024_rot256(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        device char4 *output4 = reinterpret_cast<device char4 *>(output);
+        for (uint column = tid; column < args.columns / 4; column += 256)
+            output4[base / 4 + column] = char4(0);
+        for (uint group = tid; group < args.groups; group += 256)
+            scales[row * args.groups + group] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    uint rotation_groups = args.columns / 256u;
+    for (uint first = 0; first < rotation_groups; first += 8u) {
+        uint group = first + simdgroup;
+        float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float local_max = 0.0f;
+        if (group < rotation_groups) {
+            device const bfloat4 *source =
+                reinterpret_cast<device const bfloat4 *>(
+                    input + base + group * 256u + lane * 8u);
+            float4 low = float4(source[0]);
+            float4 high = float4(source[1]);
+            v[0] = low.x; v[1] = low.y; v[2] = low.z; v[3] = low.w;
+            v[4] = high.x; v[5] = high.y; v[6] = high.z; v[7] = high.w;
+            h3_rot256_simd(v);
+            local_max = h3_rot256_abs_max(v);
+        }
+        local_max = simd_max(local_max);
+        if (lane == 0) scratch[simdgroup] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint quad = simdgroup & ~3u;
+        float max_abs = max(max(scratch[quad], scratch[quad + 1u]),
+                            max(scratch[quad + 2u], scratch[quad + 3u]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (group < rotation_groups) {
+            float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+            float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+            if (lane == 0 && (simdgroup & 3u) == 0)
+                scales[row * args.groups + group / 4u] = scale;
+            h3_rot256_store_int8(output, base + group * 256u + lane * 8u, v,
+                                 inverse);
+        }
+    }
+}
+
+/* h3_gate_adaln_quantize_int8 whose int8 consumer (QKV or FC1) has its K
+ * rotated by H256: the BF16-rounded AdaLN row is rotated in F32 per 256 group
+ * before the per-row scale. Gated residual bytes are unchanged. */
+kernel void h3_gate_adaln_quantize_int8_rot256(
+                         device const ushort *residual [[buffer(0)]],
+                         device const ushort *branch [[buffer(1)]],
+                         device const ushort *gate_modulation [[buffer(2)]],
+                         device const uint *row_map [[buffer(3)]],
+                         device const ushort *weight [[buffer(4)]],
+                         device const ushort *norm_modulation [[buffer(5)]],
+                         device ushort *gated_residual [[buffer(6)]],
+                         device int8_t *quantized [[buffer(7)]],
+                         device float *quantized_scales [[buffer(8)]],
+                         constant h3_gate_adaln_args &args [[buffer(9)]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]],
+                         uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint VECTOR_WIDTH = 5376 / 4;
+    constexpr uint GROUPS = 5376 / 256;
+    constexpr uint MAX_ROUNDS = (GROUPS + 7u) / 8u;
+    if (row >= args.rows) {
+        device char4 *quantized4 =
+            reinterpret_cast<device char4 *>(quantized);
+        uint quantized_base = row * VECTOR_WIDTH;
+        for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256)
+            quantized4[quantized_base + vector] = char4(0);
+        if (tid == 0) quantized_scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float reductions[256];
+    threadgroup ushort4 gated_values[VECTOR_WIDTH];
+    threadgroup float max_scratch[8];
+    uint base = row_map[row] * args.slots * args.width;
+    uint vector_base = row * VECTOR_WIDTH;
+    uint modulation_base = base / 4;
+    device const ushort4 *residual4 =
+        reinterpret_cast<device const ushort4 *>(residual);
+    device const ushort4 *branch4 =
+        reinterpret_cast<device const ushort4 *>(branch);
+    device const ushort4 *gate4 =
+        reinterpret_cast<device const ushort4 *>(gate_modulation);
+    device ushort4 *gated_residual4 =
+        reinterpret_cast<device ushort4 *>(gated_residual);
+    for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
+        ushort4 residual_bits = residual4[vector_base + vector];
+        ushort4 branch_bits = branch4[vector_base + vector];
+        ushort4 gate_bits = gate4[modulation_base +
+            args.gate_slot * VECTOR_WIDTH + vector];
+        float4 gated_float = h3_bf16x4_to_f32(residual_bits) +
+            h3_bf16x4_to_f32(branch_bits) * h3_bf16x4_to_f32(gate_bits);
+        ushort4 gated = h3_f32x4_to_bf16(gated_float);
+        gated_residual4[vector_base + vector] = gated;
+        gated_values[vector] = gated;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup ushort *gated_scalars =
+        reinterpret_cast<threadgroup ushort *>(gated_values);
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += 256) {
+        float value = h3_bf16_to_f32(gated_scalars[column]);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride >= 32; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < 32) {
+        float sum = reductions[tid];
+        for (uint stride = 16; stride; stride >>= 1) {
+            float partner = simd_shuffle_down(sum, stride);
+            if (tid < stride) sum += partner;
+        }
+        if (tid == 0)
+            reductions[0] = rsqrt(sum / float(args.width) + args.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const ushort4 *weight4 =
+        reinterpret_cast<device const ushort4 *>(weight);
+    device const ushort4 *norm_modulation4 =
+        reinterpret_cast<device const ushort4 *>(norm_modulation);
+    float inverse = reductions[0];
+    for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
+        ushort4 gated = gated_values[vector];
+        ushort4 norm_bits = weight4[vector];
+        ushort4 shift_bits = norm_modulation4[modulation_base +
+            args.shift_slot * VECTOR_WIDTH + vector];
+        ushort4 scale_bits = norm_modulation4[modulation_base +
+            args.scale_slot * VECTOR_WIDTH + vector];
+        float4 normalized = h3_bf16x4_to_f32(gated) * inverse *
+            h3_bf16x4_to_f32(norm_bits);
+        float4 value_float = normalized *
+            (float4(1.0f) + h3_bf16x4_to_f32(scale_bits)) +
+            h3_bf16x4_to_f32(shift_bits);
+        gated_values[vector] = h3_f32x4_to_bf16(value_float);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v[MAX_ROUNDS][8];
+    float local_max = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < GROUPS) {
+            uint vector = group * 64u + lane * 2u;
+            float4 low = h3_bf16x4_to_f32(gated_values[vector]);
+            float4 high = h3_bf16x4_to_f32(gated_values[vector + 1u]);
+            v[round][0] = low.x; v[round][1] = low.y;
+            v[round][2] = low.z; v[round][3] = low.w;
+            v[round][4] = high.x; v[round][5] = high.y;
+            v[round][6] = high.z; v[round][7] = high.w;
+            h3_rot256_simd(v[round]);
+            local_max = max(local_max, h3_rot256_abs_max(v[round]));
+        }
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, max_scratch, simdgroup, lane);
+    float output_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    float quantize_scale = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0) quantized_scales[row] = output_scale;
+    #pragma clang loop unroll(full)
+    for (uint round = 0; round < MAX_ROUNDS; round++) {
+        uint group = simdgroup + 8u * round;
+        if (group < GROUPS)
+            h3_rot256_store_int8(quantized,
+                                 row * 5376u + group * 256u + lane * 8u,
+                                 v[round], quantize_scale);
+    }
+}
