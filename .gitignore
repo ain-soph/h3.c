@@ -33,3 +33,4 @@ libh3.a
 h3_bench_*
 h3_pack_int8
 h3_sparse_test
+h3_bitexact_vae_ops

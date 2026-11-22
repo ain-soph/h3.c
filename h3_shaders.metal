@@ -241,6 +241,39 @@ kernel void h3_rms_norm_f32(device const float *input [[buffer(0)]],
         output[row * args.width + column] = x[column] * inverse * weight[column];
 }
 
+/* Track B (video VAE, BF16 matrices): h3_rms_norm_f32 followed by
+ * h3_cast_f32_to_bf16 in one pass. Same reduction (the host dispatches the same
+ * 256-thread rows) and the same per-element expression, so the BF16 output is
+ * bit-identical to the two-kernel chain (tests/bitexact_vae_ops.c). */
+kernel void h3_rms_norm_f32_to_bf16(device const float *input [[buffer(0)]],
+                                    device const float *weight [[buffer(1)]],
+                                    device ushort *output [[buffer(2)]],
+                                    constant norm_args &args [[buffer(3)]],
+                                    uint3 group [[threadgroup_position_in_grid]],
+                                    uint3 thread_position [[thread_position_in_threadgroup]],
+                                    uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const float *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads)
+        local_sum = fma(x[k], x[k], local_sum);
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float value = x[column] * inverse * weight[column];
+        output[row * args.width + column] = h3_f32_to_bf16(value);
+    }
+}
+
 struct scale_add_args { uint rows; uint width; };
 
 kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
@@ -343,6 +376,73 @@ kernel void h3_video_qkv_rope_f32(
     query[output_index] = q0;
     key[output_index] = k0;
     value[output_index] = qkv[base + args.head_dim * 2 + dimension];
+}
+
+/* Track B: h3_video_qkv_rope_f32 followed by the three F32->BF16 casts, with
+ * one simdgroup per (row, head) instead of one thread per dimension that each
+ * re-reads the whole head. Lane l owns dimensions l and l + 32 (head_dim 64).
+ * The sums of squares keep the reference's sequential FMA order d = 0..63
+ * (every lane walks the head through simd_shuffle), and the per-dimension
+ * expressions are the reference's, so the BF16 Q/K/V are bit-identical. */
+kernel void h3_video_qkv_rope_bf16(
+                            device const float *qkv [[buffer(0)]],
+                            device const float *rope_cos [[buffer(1)]],
+                            device const float *rope_sin [[buffer(2)]],
+                            device ushort *query [[buffer(3)]],
+                            device ushort *key [[buffer(4)]],
+                            device ushort *value [[buffer(5)]],
+                            constant qkv_args &args [[buffer(6)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            ushort lane [[thread_index_in_simdgroup]]) {
+    uint head = group.x;
+    uint row = group.y;
+    if (head >= args.heads || row >= args.sequence) return;
+    uint base = (row * args.heads + head) * args.head_dim * 3;
+    float qa = qkv[base + lane], qb = qkv[base + 32 + lane];
+    float ka = qkv[base + args.head_dim + lane];
+    float kb = qkv[base + args.head_dim + 32 + lane];
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (ushort d = 0; d < 32; d++) {
+        float q = simd_shuffle(qa, d);
+        float k = simd_shuffle(ka, d);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    for (ushort d = 0; d < 32; d++) {
+        float q = simd_shuffle(qb, d);
+        float k = simd_shuffle(kb, d);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float qi = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+    float ki = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    uint output_base = (row * args.heads + head) * args.head_dim;
+    for (uint half_index = 0; half_index < 2; half_index++) {
+        uint dimension = lane + half_index * 32;
+        float q0 = qkv[base + dimension] * qi;
+        float k0 = qkv[base + args.head_dim + dimension] * ki;
+        if (dimension < args.rope_half) {
+            uint pair = dimension + args.rope_half;
+            float q1 = qkv[base + pair] * qi;
+            float k1 = qkv[base + args.head_dim + pair] * ki;
+            float c = rope_cos[row * args.rope_half + dimension];
+            float s = rope_sin[row * args.rope_half + dimension];
+            q0 = q0 * c - q1 * s;
+            k0 = k0 * c - k1 * s;
+        } else if (dimension < args.rope_half * 2) {
+            uint pair = dimension - args.rope_half;
+            float q1 = qkv[base + pair] * qi;
+            float k1 = qkv[base + args.head_dim + pair] * ki;
+            float c = rope_cos[row * args.rope_half + pair];
+            float s = rope_sin[row * args.rope_half + pair];
+            q0 = q0 * c + q1 * s;
+            k0 = k0 * c + k1 * s;
+        }
+        query[output_base + dimension] = h3_f32_to_bf16(q0);
+        key[output_base + dimension] = h3_f32_to_bf16(k0);
+        value[output_base + dimension] =
+            h3_f32_to_bf16(qkv[base + args.head_dim * 2 + dimension]);
+    }
 }
 
 struct adaln_args {
@@ -473,6 +573,21 @@ kernel void h3_swiglu_f32(device const float *fused [[buffer(0)]],
     float gate = fused[base + column];
     float up = fused[base + args.width + column];
     output[row * args.width + column] = gate / (1.0f + exp(-gate)) * up;
+}
+
+/* Track B: h3_swiglu_f32 followed by h3_cast_f32_to_bf16 (same expression). */
+kernel void h3_swiglu_f32_to_bf16(device const float *fused [[buffer(0)]],
+                                  device ushort *output [[buffer(1)]],
+                                  constant swiglu_args &args [[buffer(2)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint base = row * args.width * 2;
+    float gate = fused[base + column];
+    float up = fused[base + args.width + column];
+    float activated = gate / (1.0f + exp(-gate)) * up;
+    output[row * args.width + column] = h3_f32_to_bf16(activated);
 }
 
 struct vae_encoder_pad_args {

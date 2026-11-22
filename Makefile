@@ -46,6 +46,10 @@ h3_bench_attn: tests/bench_attn.o $(LIB_OBJ)
 h3_bench_vae_block: tests/bench_vae_block.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# Track B: fused video VAE ops are bit-identical to the chains they replace.
+h3_bitexact_vae_ops: tests/bitexact_vae_ops.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tests: tests/test_h3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -222,6 +226,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
+	rm -f h3_bitexact_vae_ops h3_bench_vae_block
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
