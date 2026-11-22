@@ -50,4 +50,13 @@ int h3_video_vae_decode(const char *weight_directory,
                         char *error, size_t error_size);
 void h3_video_frames_free(h3_video_frames *frames);
 
+/* B3: read the decoder's weight files into the page cache on a background
+ * (QoS background) thread, e.g. while the DiT denoises, so the decoder load
+ * that follows does not wait on the SSD. Nothing is allocated on the GPU and
+ * nothing computed changes. Off with H3_VAE_PREFETCH=0 (then start returns
+ * NULL). finish stops an unfinished read and joins; NULL is fine. */
+typedef struct h3_video_vae_prefetch h3_video_vae_prefetch;
+h3_video_vae_prefetch *h3_video_vae_prefetch_start(const char *weight_directory);
+void h3_video_vae_prefetch_finish(h3_video_vae_prefetch *prefetch);
+
 #endif
