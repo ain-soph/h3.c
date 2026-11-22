@@ -1,3 +1,27 @@
+> **ain-soph fork (`serving` branch, based on upstream `8974cc0`).** What differs from upstream:
+>
+> | Change | Why | Enable / default | Effect (M5 Ultra) |
+> |---|---|---|---|
+> | Packed INT8 DiT (`h3_pack_int8`) | on-the-fly BF16 → INT8 at every load | offline tool; used when `<variant>/transformer-int8/` exists | DiT 66.3 → 23.9 GB per checkpoint; 512×288 25 frames 28.9 → 18.0 s; T2V byte-identical |
+> | Zero-copy INT8 DiT (`tools/align_int8_pack.py`) | map weights instead of copying them | default on M5 when page-aligned (`H3_ZERO_COPY_WEIGHTS`) | DiT load 2.29 → 0.33 s; byte-identical |
+> | Per-block DiT Metal buffers | Metal wires a buffer as long as it lives | `H3_DIT_STREAM_WEIGHTS` (default on) | 768p wired 21.9 → 14.3 GB; same speed; byte-identical |
+> | BF16 video VAE (TensorOps) | FP32 VAE decode is slow | `H3_VAE_BF16=2` (off; `1` = linears only) | 768p VAE 79.0 → 33.6 s; PSNR 51.7 dB (linear-only variant) |
+> | BF16-stored VAE decoder matrices (`tools/vae_bf16.py`) | `H3_VAE_BF16` rounds them to BF16 at load anyway | loader accepts either; F32 path widens | video VAE 10.4 → 5.6 GB; byte-identical MP4; 512² VAE 2.75 → 2.09 s |
+> | VAE linear tiles 128×64 | 46–62 TFLOPS with 128×128 | always | 768p VAE 33.6 → 25.0 s; byte-identical |
+> | NAX attention, block-sparse attention, token reduction | approximate fast preset | `H3_ATTN=nax`, `H3_SPARSE=...`, `H3_TOKEN_REDUCTION` (off) | 768p 5 s fast 412 → 170 s; approximate, composition may change |
+> | Threadgroup race fixes (causal GQA softmax, VAE group norm) | long prompts and conditioned renders were irreproducible | always | same request → same MP4; speed unchanged |
+> | INT8 text encoder shared with H3 image (`FL2VA/text_encoder-int8/`) | the BF16 Qwen3-VL encoder is 62 GB and reads ~49 GB per render; the H3 image INT8 convrot file holds the same weights | used when `text_encoder-int8/h3-te-int8.json` exists (`H3_TE=bf16` forces BF16); W8A16 per class (`H3_QWEN_W8A16`) | text encoder 3.0–3.7 → 2.4–2.5 s, reads 49 → 24 GB, 62 GB of BF16 no longer needed; output rel. RMS 0.4–0.6%; 768p render PSNR 28 dB vs BF16 (same composition) |
+> | Prompt-conditioning disk cache (`h3_cond_cache.c`) | each render is a new process: tokenizer + text encoder (~2.5 s, ~24 GB read) re-ran for a repeated prompt | `H3_COND_CACHE_DIR=<dir>` (off), `H3_COND_CACHE_MAX_MB` (2048, LRU) | hit skips tokenizer + text encoder (+ keyframe / reference encoders): 512² 1 s 17.3 → 14.3 s, 768p 5 s 283.0 → 279.8 s, Ref2VA 2.5 s video reference 58.9 → 21.4 s; byte-identical MP4 |
+> | Video VAE decoder: BF16 GEMM inputs written directly (Track B1) | every BF16 linear re-rounded an F32 activation | `H3_VAE_FUSED` (default on with `H3_VAE_BF16`; `0` = separate kernels) | 768p 5 s VAE decode 24.43 → 21.72 s; byte-identical frames |
+> | Video VAE decoder: pipelined tiles + weight page prefetch (Track B3) | GPU idle while the CPU unpacks / stitches each tile | `H3_VAE_PREFETCH` (default on; `0` = serial) | 768p VAE decode 21.72 → 21.10 s; byte-identical |
+> | Video VAE encoder: buffer arena, one command chain per tile, fused GroupNorm+SiLU+pad (Track B4) | a sync wait and fresh multi-GB buffers per residual block | `H3_VAE_ENC_OPT` (default on; `0` = per-op path) | Ref2VA 3 s context 768p 156.6 → 127.4 s, 512² 50.3 → 41.1 s; FL2VA 768p 4.95 → 3.33 s per image; byte-identical latents |
+> | Encoder opt-in variants (never default) | single-image 2D conv / BF16 convs | `H3_VAE_ENC_FAST=1`, `H3_VAE_ENC_BF16=1` (off) | not byte-identical: FAST 3.33 → 0.62 s per 768p image, latent rel. L2 2.6e-6 (misses the 1e-6 equivalence gate); BF16 Ref2VA 768p 127.4 → 110.9 s, rel. L2 2.2–2.7% |
+> | Hadamard-rotated W8A8 DiT (Track A, `h3_pack_int8 --rot qkv,fc1,fc2`, `h3_rot.c`) | INT8 activation outliers in qkv / fc1 / fc2 inputs; H256 = (H4/2)^⊗4 rotation (W x = (W H)(H x)) spreads them | `H3_DIT_VARIANT=rot256` selects `FL2VA/transformer-int8-rot256` (rotation read from the pack marker and checked against every file's metadata; a mismatch is refused); run with `--use-int8-row-fc2`; default pack unchanged | DiT velocity error vs BF16 ×0.732 (teacher forcing); 768p 124f denoise best 655.5 → 646.5 s, standard 251.3 → 246.9 s; same load / memory. Not byte-identical (trajectories diverge on some seeds). Never rename the pack to `transformer-int8`: older binaries do not read the rotation |
+> | LoRA fold tool (`tools/fold_lora.py`) | the Turbo preset needs the distill LoRA merged into the BF16 DiT shards before INT8 packing | offline tool; stochastic rounding | — |
+> | Test and study hooks (`H3_DUMP_LATENTS/FRAMES`, `H3_TEXT_EMB_OUT/IN`, `H3_DIT_DIR`, `H3_TEACHER_FORCE_*`, `H3_VAE_LATENT_IN/OUT`, `H3_VAE_RGB_OUT`, `H3_DUMP_ENC_LATENT`, `H3_STOP_AFTER_ENCODE`) | byte-level A/B of each stage | env vars (all off); the conditioning disk cache is off while they are set | none when unset |
+>
+> Full numbers: [MiniMax H3 Video in ain-soph/llm-serving](https://github.com/ain-soph/llm-serving/blob/main/docs/performance.md#视频音频minimax-h3-video). Upstream PRs: [#98](https://github.com/antirez/h3.c/pull/98), [#99](https://github.com/antirez/h3.c/pull/99) (open). Upstream PR [#77](https://github.com/antirez/h3.c/pull/77) (opt-in SDPA query splitting), part of earlier `serving` heads, is no longer included: it is off by default and not used on M5.
+
 # h3-metal
 
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
