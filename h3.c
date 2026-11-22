@@ -1218,7 +1218,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             prompt, params, render_width, render_height, ref2va,
             tokenizer_path, text_path, vae_path, audio_vae_path,
             "h3_shaders.metal", ctx->device.name, fl2va_video_elements};
-        cond_disk_enabled = h3_cond_disk_open(&cond_disk, &disk_inputs);
+        /* The Track A text-embedding hooks bypass (IN) or need (OUT) the text
+         * encoder run; the disk cache key does not cover the file's content,
+         * so they disable the cache. */
+        const char *emb_in = getenv("H3_TEXT_EMB_IN");
+        const char *emb_out = getenv("H3_TEXT_EMB_OUT");
+        int text_hook = (emb_in && *emb_in) || (emb_out && *emb_out);
+        if (text_hook && getenv("H3_COND_CACHE_DIR") &&
+            *getenv("H3_COND_CACHE_DIR"))
+            fprintf(stderr, "h3: conditioning disk cache off "
+                            "(H3_TEXT_EMB_IN/OUT)\n");
+        cond_disk_enabled = !text_hook &&
+            h3_cond_disk_open(&cond_disk, &disk_inputs);
         if (cond_disk_enabled) {
             size_t cached_reference_count = 0;
             disk_hit = h3_cond_disk_load(
