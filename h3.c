@@ -1069,6 +1069,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
     h3_video_vae_decoder *preview_decoder = NULL;
+    h3_video_vae_prefetch *vae_prefetch = NULL;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
@@ -1839,6 +1840,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
     h3_debug_hash("noise-video", 0, video, video_count * sizeof(*video));
+    /* B3: warm the decoder weights' pages while the DiT runs (no-op when the
+     * resident decoder is already loaded). */
+    if (!preview_decoder) vae_prefetch = h3_video_vae_prefetch_start(vae_path);
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
@@ -1854,6 +1858,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         goto cleanup;
     }
+    h3_video_vae_prefetch_finish(vae_prefetch);
+    vae_prefetch = NULL;
     h3_debug_hash("denoised-video", 0, video, video_count * sizeof(*video));
     h3_debug_hash("denoised-audio", 0, audio, audio_count * sizeof(*audio));
     if (!dit_is_cached) h3_dit_free(dit);
@@ -1974,6 +1980,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_video_vae_prefetch_finish(vae_prefetch);
     free(conditioning_key);
     h3_cond_disk_close(&cond_disk);
     free(prepared_key);
