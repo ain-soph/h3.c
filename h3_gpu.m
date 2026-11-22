@@ -2446,7 +2446,9 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
  * F32 input cast to BF16 in the graph, BF16 weights, result cast back to F32
  * before the F32 bias); 2: T=1 as a 2D convolution (H3_VAE_ENC_FAST, opt-in:
  * depth must equal kernel_depth after the causal pad, the weight is the last
- * temporal tap [O][I][kh][kw]; numerically equivalent, not bit-identical). */
+ * temporal tap [O][I][kh][kw] on the single real frame, i.e. the caller
+ * leaves out the causal zero frames and passes depth 1; numerically
+ * equivalent, not bit-identical). */
 static H3Conv *h3_gpu_conv3d_graph(
         H3GPU *gpu, uint32_t batch, uint32_t depth, uint32_t height,
         uint32_t width, uint32_t input_channels, uint32_t output_channels,
@@ -2473,7 +2475,7 @@ static H3Conv *h3_gpu_conv3d_graph(
         conv.outputShape = @[@(batch), @(output_depth), @(output_height),
                              @(output_width), @(output_channels)];
         if (mode == 2) {
-            /* [B,1+front,H,W,C] padded input: only the last (real) frame. */
+            /* [B,1,H,W,C] spatially padded single frame as NHWC */
             conv.inputShape = @[@(batch), @(height), @(width), @(input_channels)];
             conv.weightShape = @[@(output_channels), @(input_channels),
                                  @(kernel_height), @(kernel_width)];
@@ -2558,10 +2560,10 @@ static int h3_gpu_conv3d(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!batch || !depth || !height || !width || !input_channels ||
         !output_channels || !kernel_depth || !kernel_height || !kernel_width ||
         !stride_depth || !stride_height || !stride_width ||
-        depth < kernel_depth || height < kernel_height || width < kernel_width ||
-        (mode == 2 && depth != kernel_depth))
+        height < kernel_height || width < kernel_width ||
+        (mode == 2 && depth != 1) || (mode != 2 && depth < kernel_depth))
         return 0;
-    uint32_t output_depth = (depth - kernel_depth) / stride_depth + 1;
+    uint32_t output_depth = mode == 2 ? 1 : (depth - kernel_depth) / stride_depth + 1;
     uint32_t output_height = (height - kernel_height) / stride_height + 1;
     uint32_t output_width = (width - kernel_width) / stride_width + 1;
     size_t input_count = (size_t)batch * depth * height * width * input_channels;
@@ -2589,22 +2591,9 @@ static int h3_gpu_conv3d(h3_gpu *opaque, h3_gpu_tensor *output,
     MPSDataType weight_type = mode == 1 ? MPSDataTypeBFloat16 : MPSDataTypeFloat32;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        /* mode 2 reads the real frame behind the depth_front zero frames */
-        NSUInteger input_offset = mode == 2 ?
-            (NSUInteger)(depth - 1) * height * width * input_channels * sizeof(float) : 0;
-        MPSGraphTensorData *input_data;
-        if (input_offset) {
-            MPSNDArrayDescriptor *descriptor = [MPSNDArrayDescriptor
-                descriptorWithDataType:MPSDataTypeFloat32 shape:conv.inputShape];
-            MPSNDArray *array = [[MPSNDArray alloc]
-                initWithBuffer:TENSOR(input).buffer offset:input_offset
-                    descriptor:descriptor];
-            input_data = [[MPSGraphTensorData alloc] initWithMPSNDArray:array];
-        } else {
-            input_data = [[MPSGraphTensorData alloc]
-                initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
-                dataType:MPSDataTypeFloat32];
-        }
+        MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
+            dataType:MPSDataTypeFloat32];
         MPSGraphTensorData *weight_data = h3_gpu_graph_data(
             weight, conv.weightShape, weight_type, stable_weights);
         MPSGraphTensorData *output_data = [[MPSGraphTensorData alloc]

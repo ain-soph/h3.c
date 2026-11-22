@@ -657,6 +657,12 @@ static int enc_conv_mode(const encoder_context *encoder,
     return conv->fast_weight ? encoder->conv_mode : 0;
 }
 
+/* causal zero frames in front: none for the single-frame 2D variant */
+static uint32_t enc_front(const encoder_context *encoder,
+                          const encoder_conv *conv) {
+    return enc_conv_mode(encoder, conv) == 2 ? 0 : conv->depth_front;
+}
+
 static int enc_conv3d(encoder_context *encoder, h3_gpu_tensor *output,
                       const h3_gpu_tensor *source, const encoder_conv *conv,
                       uint32_t source_depth, uint32_t source_height,
@@ -682,10 +688,12 @@ static h3_gpu_tensor *opt_conv(encoder_context *encoder, h3_gpu_tensor *input,
                                uint32_t *output_depth, uint32_t *output_height,
                                uint32_t *output_width, char *error,
                                size_t error_size) {
-    uint32_t padded_d = depth + conv->depth_front;
+    uint32_t front = enc_front(encoder, conv);
+    uint32_t padded_d = depth + front;
     uint32_t padded_h = height + conv->height_before + conv->height_after;
     uint32_t padded_w = width + conv->width_before + conv->width_after;
-    *output_depth = (padded_d - conv->kernel) / conv->stride_t + 1;
+    *output_depth = front == conv->depth_front ?
+        (padded_d - conv->kernel) / conv->stride_t + 1 : 1;
     *output_height = (padded_h - conv->kernel) / conv->stride_h + 1;
     *output_width = (padded_w - conv->kernel) / conv->stride_w + 1;
     h3_gpu_tensor *padded = conv_padded(conv) ? pool_get(encoder,
@@ -701,7 +709,7 @@ static h3_gpu_tensor *opt_conv(encoder_context *encoder, h3_gpu_tensor *input,
     }
     int ok = (!padded || gpu_op(encoder, h3_gpu_vae_encoder_pad_f32(
                  encoder->gpu, padded, input, 1, depth, height, width,
-                 conv->input_channels, conv->depth_front, conv->height_before,
+                 conv->input_channels, front, conv->height_before,
                  conv->height_after, conv->width_before, conv->width_after),
                  error, error_size, "visual encoder causal padding")) &&
              enc_conv3d(encoder, output, padded ? padded : input, conv,
@@ -721,7 +729,8 @@ static h3_gpu_tensor *opt_norm_conv(encoder_context *encoder,
                                     const encoder_conv *conv, uint32_t depth,
                                     uint32_t height, uint32_t width,
                                     char *error, size_t error_size) {
-    uint32_t padded_d = depth + conv->depth_front;
+    uint32_t front = enc_front(encoder, conv);
+    uint32_t padded_d = depth + front;
     uint32_t padded_h = height + conv->height_before + conv->height_after;
     uint32_t padded_w = width + conv->width_before + conv->width_after;
     h3_gpu_tensor *padded = pool_get(encoder, tensor_elements(
@@ -737,7 +746,7 @@ static h3_gpu_tensor *opt_norm_conv(encoder_context *encoder,
     int ok = gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_pad_f32(
                  encoder->gpu, padded, input, norm->weight, norm->bias, 1,
                  depth, height, width, conv->input_channels, GROUPS, 1e-6f,
-                 conv->depth_front, conv->height_before, conv->height_after,
+                 front, conv->height_before, conv->height_after,
                  conv->width_before, conv->width_after),
                  error, error_size, "visual encoder group norm") &&
              enc_conv3d(encoder, output, padded, conv, padded_d, padded_h,
