@@ -241,6 +241,74 @@ static size_t test_linear(uint32_t rows, uint32_t in, uint32_t out,
     return (size_t)rows * in + (size_t)out * in + out;
 }
 
+/* Encoder: group_norm_silu + pad  vs  group_norm_silu_pad (padded output),
+ * and the arena Conv3d (cached weight data, oversized output buffer) vs the
+ * per-call Conv3d. */
+static size_t test_encoder_norm_pad(uint32_t depth, uint32_t height,
+                                    uint32_t width, uint32_t channels,
+                                    uint32_t front, uint32_t before,
+                                    uint32_t after, const char *label) {
+    size_t count = (size_t)depth * height * width * channels;
+    size_t padded = (size_t)(depth + front) * (height + before + after) *
+                    (width + before + after) * channels;
+    float *x = malloc(count * sizeof(*x));
+    float *w = malloc(channels * sizeof(*w)), *b = malloc(channels * sizeof(*b));
+    fill(x, (size_t)depth * height, (size_t)width * channels, 97);
+    fill(w, 1, channels, 0);
+    fill(b, 1, channels, 0);
+    h3_gpu_tensor *input = upload(x, count), *weight = upload(w, channels),
+                  *bias = upload(b, channels);
+    h3_gpu_tensor *norm = f32(count), *reference = f32(padded),
+                  *fused = f32(padded + 4096);
+    begin();
+    run("reference encoder norm + pad",
+        h3_gpu_vae_encoder_group_norm_silu_f32(gpu, norm, input, weight, bias, 1,
+            depth, height, width, channels, 32, 1e-6f) &&
+        h3_gpu_vae_encoder_pad_f32(gpu, reference, norm, 1, depth, height, width,
+            channels, front, before, after, before, after));
+    begin();
+    run("fused encoder norm + pad",
+        h3_gpu_vae_encoder_group_norm_silu_pad_f32(gpu, fused, input, weight, bias,
+            1, depth, height, width, channels, 32, 1e-6f, front, before, after,
+            before, after));
+    compare_f32(label, reference, fused, padded);
+    h3_gpu_tensor *all[] = {input, weight, bias, norm, reference, fused};
+    for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) h3_gpu_tensor_free(all[i]);
+    free(x); free(w); free(b);
+    return count + 2 * channels;
+}
+
+static size_t test_encoder_conv(void) {
+    const uint32_t depth = 7, height = 34, width = 34, cin = 128, cout = 128;
+    size_t count = (size_t)depth * height * width * cin;
+    size_t weights = (size_t)cout * cin * 27;
+    size_t out = (size_t)(depth - 2) * (height - 2) * (width - 2) * cout;
+    float *x = malloc(count * sizeof(*x)), *w = malloc(weights * sizeof(*w)),
+          *b = malloc(cout * sizeof(*b));
+    fill(x, (size_t)depth * height, (size_t)width * cin, 0);
+    fill(w, cout, cin * 27, 0);
+    for (size_t i = 0; i < weights; i++) w[i] *= 0.01f;
+    fill(b, 1, cout, 0);
+    h3_gpu_tensor *input = upload(x, count), *weight = upload(w, weights),
+                  *bias = upload(b, cout);
+    h3_gpu_tensor *reference = f32(out), *arena = f32(out * 2);
+    begin();
+    run("reference Conv3d",
+        h3_gpu_conv3d_f32(gpu, reference, input, weight, bias, 1, depth, height,
+                          width, cin, cout, 3, 3, 3, 1, 1, 1));
+    for (int repeat = 0; repeat < 2; repeat++) {   /* second call: cached data */
+        begin();
+        run("arena Conv3d",
+            h3_gpu_conv3d_f32_ex(gpu, arena, input, weight, bias, 1, depth, height,
+                                 width, cin, cout, 3, 3, 3, 1, 1, 1, 0));
+    }
+    compare_f32("Conv3d, cached weights + big buffer", reference, arena, out);
+    h3_gpu_tensor *all[] = {input, weight, bias, reference, arena};
+    for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) h3_gpu_tensor_free(all[i]);
+    free(x); free(w); free(b);
+    return count + weights + cout;
+}
+
 /* The SDPA output skips BF16 -> F32 -> BF16: identity on all 65536 patterns. */
 static void test_round_trip(void) {
     size_t count = 65536 * 16;
@@ -278,6 +346,13 @@ int main(int argc, char **argv) {
         generated += test_swiglu();
         generated += test_linear(2805, HIDDEN, INNER * 3, "QKV linear, BF16 input");
         generated += test_linear(2805, FFN, HIDDEN, "MLP output linear, BF16 input");
+        generated += test_encoder_norm_pad(9, 64, 64, 128, 2, 1, 1,
+                                           "encoder norm+pad (2,1,1)");
+        generated += test_encoder_norm_pad(5, 32, 48, 256, 2, 0, 1,
+                                           "encoder norm+pad (2,0,1)");
+        generated += test_encoder_norm_pad(1, 16, 16, 1024, 2, 1, 1,
+                                           "encoder norm+pad T=1");
+        generated += test_encoder_conv();
         test_round_trip();
         printf("  random input values: %zu\n", generated);
     }

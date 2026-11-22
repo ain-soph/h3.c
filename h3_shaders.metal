@@ -719,6 +719,118 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
     }
 }
 
+/* Track B (video VAE encoder): h3_vae_encoder_group_norm_silu_f32 writing
+ * straight into the causally / reflect-padded input of the next Conv3d, i.e.
+ * the norm followed by h3_vae_encoder_pad_f32 without the unpadded tensor.
+ * Same reduction and per-element expression as the norm (bit-identical);
+ * spatial padding of at most one element per side (reflection: the element
+ * at 1 also lands on -1, the one at n - 2 also on n). The threadgroups of the
+ * first frame also write the depth_front zero frames. */
+struct vae_encoder_norm_pad_args {
+    uint batch;
+    uint depth;
+    uint height;
+    uint width;
+    uint channels;
+    uint groups;
+    float epsilon;
+    uint depth_front;
+    uint height_before;
+    uint height_after;
+    uint width_before;
+    uint width_after;
+};
+
+kernel void h3_vae_encoder_group_norm_silu_pad_f32(
+                            device const float *input [[buffer(0)]],
+                            device const float *weight [[buffer(1)]],
+                            device const float *bias [[buffer(2)]],
+                            device float *output [[buffer(3)]],
+                            constant vae_encoder_norm_pad_args &args [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint rows = args.batch * args.depth * args.groups;
+    if (row >= rows) return;
+    uint channels_per_group = args.channels / args.groups;
+    uint group_index = row % args.groups;
+    uint temporal_plane = row / args.groups;
+    uint elements = args.height * args.width * channels_per_group;
+    threadgroup float reductions[256];
+    float local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        local += input[source];
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(elements);
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* read before reuse */
+    local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        float centered = input[source] - mean;
+        local = fma(centered, centered, local);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(elements) + args.epsilon);
+    uint frame = temporal_plane % args.depth;
+    uint batch = temporal_plane / args.depth;
+    uint out_depth = args.depth + args.depth_front;
+    uint out_height = args.height + args.height_before + args.height_after;
+    uint out_width = args.width + args.width_before + args.width_after;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+            args.channels + channel;
+        float value = (input[source] - mean) * inverse * weight[channel] +
+                      bias[channel];
+        float activated = value / (1.0f + exp(-value));
+        uint y = spatial / args.width, x = spatial % args.width;
+        /* reflection: -1 reads element 1, n reads element n - 2 */
+        uint ys[3], xs[3], ny = 1, nx = 1;
+        ys[0] = y + args.height_before;
+        xs[0] = x + args.width_before;
+        if (args.height_before && y == 1) ys[ny++] = 0;
+        if (args.height_after && y + 2 == args.height) ys[ny++] = out_height - 1;
+        if (args.width_before && x == 1) xs[nx++] = 0;
+        if (args.width_after && x + 2 == args.width) xs[nx++] = out_width - 1;
+        size_t plane = (size_t)batch * out_depth;
+        for (uint a = 0; a < ny; a++)
+            for (uint b = 0; b < nx; b++) {
+                size_t pixel = (size_t)ys[a] * out_width + xs[b];
+                output[((plane + frame + args.depth_front) * out_height *
+                        out_width + pixel) * args.channels + channel] = activated;
+                if (frame == 0)
+                    for (uint t = 0; t < args.depth_front; t++)
+                        output[((plane + t) * out_height * out_width + pixel) *
+                               args.channels + channel] = 0.0f;
+            }
+    }
+}
+
 struct weight_norm_args {
     uint outer;
     uint inner;
