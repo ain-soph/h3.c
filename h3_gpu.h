@@ -308,9 +308,9 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
 
 /* Track B encoder: Conv3d with the weight/bias MPSGraphTensorData cached on
  * the tensors. mode 0 = F32 (identical to h3_gpu_conv3d_f32), 1 = BF16 compute
- * with a BF16 weight (opt-in H3_VAE_ENC_BF16), 2 = one real frame behind the
- * causal zero frames as a 2D convolution with the last temporal tap
- * [O][I][kh][kw] as weight (opt-in H3_VAE_ENC_FAST). */
+ * with a BF16 weight (opt-in H3_VAE_ENC_BF16), 2 = a single frame (depth 1,
+ * the causal zero frames left out) as a 2D convolution with the last temporal
+ * tap [O][I][kh][kw] as weight (opt-in H3_VAE_ENC_FAST). */
 int h3_gpu_conv3d_f32_ex(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight,
