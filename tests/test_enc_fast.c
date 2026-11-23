@@ -1,15 +1,11 @@
-/* H3_VAE_ENC_FAST (single image, T = 1): every causally padded 3x3x3 video VAE
- * encoder conv sees two zero frames and the image, so only its last temporal
- * tap contributes. This compares, on the encoder's real layer shapes (one
- * 256x256 tile) and random activation-like data:
- *   ref   the default path: Conv3d over [0, 0, x] with the full 3x3x3 weight
- *   kd1   Conv3d over the single frame x with the last tap as a 1x3x3 kernel
- *         (H3_VAE_ENC_FAST=1)
- *   2d    MPSGraph Conv2d over x with the last tap (the earlier 7988075
- *         variant, H3_VAE_ENC_FAST=2d; rel L2 ~2.6e-6 end to end)
- * and reports bit differences, max |diff|, rel L2 and the median GPU wall time
- * of each. Fails if a kd1 output's rel L2 exceeds 1e-6 (the plan's gate is on
- * the latent; per op it should be far below).
+/* Video VAE encoder, single image (T = 1): every causally padded 3x3x3 conv
+ * sees two zero frames and the image, so only its last temporal tap
+ * contributes, and the encoder runs the image alone through a 1x3x3 Conv3d
+ * with that tap (CONV_LAST_TAP). This checks, on the encoder's real layer
+ * shapes (one 256x256 tile) and random activation-like data, that the result
+ * is byte-identical to the reference, the full 3x3x3 Conv3d over [0, 0, x]
+ * with real weights on the zero-frame taps; --bench adds the median GPU wall
+ * time of each.
  * Usage: h3_enc_fast_test [--bench] [SEED]   (run from the checkout) */
 #include "h3_gpu.h"
 #include <math.h>
@@ -78,25 +74,21 @@ static const shape shapes[] = {
     {1024, 48, 18, 1, 1, "conv_out"},
 };
 
-enum { VARIANTS = 3 };
-static const char *variant_names[VARIANTS] = {"ref", "kd1", "2d"};
+enum { VARIANTS = 2 };
+static const char *variant_names[VARIANTS] = {"ref", "last tap"};
 
 static int run_variant(int variant, h3_gpu_tensor *out, h3_gpu_tensor *padded,
                        h3_gpu_tensor *single, h3_gpu_tensor *w3, h3_gpu_tensor *w1,
-                       h3_gpu_tensor *bias, h3_gpu_tensor *w1_2d,
-                       h3_gpu_tensor *bias_2d, const shape *s) {
+                       h3_gpu_tensor *bias, const shape *s) {
     uint32_t n = s->size, k = 3, st = s->stride, tt = s->stride_t;
     if (!h3_gpu_begin(gpu)) return 0;
     int ok;
     if (variant == 0)
         ok = h3_gpu_conv3d_f32_ex(gpu, out, padded, w3, bias, 1, 3, n, n, s->cin,
                                   s->cout, k, k, k, tt, st, st, 0);
-    else if (variant == 1)
+    else
         ok = h3_gpu_conv3d_f32_ex(gpu, out, single, w1, bias, 1, 1, n, n, s->cin,
                                   s->cout, 1, k, k, tt, st, st, 0);
-    else   /* own weight / bias tensors: their cached graph data has a 4D shape */
-        ok = h3_gpu_conv3d_f32_ex(gpu, out, single, w1_2d, bias_2d, 1, 1, n, n,
-                                  s->cin, s->cout, k, k, k, tt, st, st, 2);
     if (!ok) { h3_gpu_abort(gpu); return 0; }
     return h3_gpu_submit(gpu);
 }
@@ -114,9 +106,8 @@ int main(int argc, char **argv) {
     if (!gpu) { fprintf(stderr, "%s\n", error); return 2; }
     int failures = 0;
     double total[VARIANTS] = {0};
-    printf("%-10s %5s %5s %4s | %-28s | %-28s | %s\n", "layer", "cin", "cout", "n",
-           "kd1: differ  max|d|  relL2", "2d: differ  max|d|  relL2",
-           bench ? "median ms ref / kd1 / 2d" : "");
+    printf("%-10s %5s %5s %4s | %-28s | %s\n", "layer", "cin", "cout", "n",
+           "last tap: differ max|d| relL2", bench ? "median ms ref / last tap" : "");
     for (size_t index = 0; index < sizeof(shapes) / sizeof(*shapes); index++) {
         const shape *s = &shapes[index];
         uint32_t n = s->size, o = (n - 3) / s->stride + 1;
@@ -135,14 +126,13 @@ int main(int argc, char **argv) {
         h3_gpu_tensor *padded = upload(x, plane * 3), *single = upload(x + 2 * plane, plane);
         h3_gpu_tensor *w3 = upload(w, taps * 27), *w1 = upload(w_last, taps * 9);
         h3_gpu_tensor *bias = upload(b, s->cout);
-        h3_gpu_tensor *w1_2d = upload(w_last, taps * 9), *bias_2d = upload(b, s->cout);
         h3_gpu_tensor *outs[VARIANTS];
         float *host[VARIANTS];
         double ms[VARIANTS] = {0};
         for (int v = 0; v < VARIANTS; v++) {
             outs[v] = f32(out_count);
             host[v] = checked(malloc(out_count * sizeof(float)));
-            if (!run_variant(v, outs[v], padded, single, w3, w1, bias, w1_2d, bias_2d, s) ||
+            if (!run_variant(v, outs[v], padded, single, w3, w1, bias, s) ||
                 !h3_gpu_tensor_read_f32(outs[v], host[v], out_count)) {
                 fprintf(stderr, "%s %s: %s\n", s->name, variant_names[v], h3_gpu_error(gpu));
                 return 2;
@@ -154,8 +144,7 @@ int main(int argc, char **argv) {
                 double t[REPS];
                 for (int r = 0; r < WARM + REPS; r++) {
                     double t0 = now();
-                    if (!run_variant(v, outs[v], padded, single, w3, w1, bias,
-                                     w1_2d, bias_2d, s)) {
+                    if (!run_variant(v, outs[v], padded, single, w3, w1, bias, s)) {
                         fprintf(stderr, "%s %s: %s\n", s->name, variant_names[v],
                                 h3_gpu_error(gpu));
                         return 2;
@@ -182,21 +171,20 @@ int main(int argc, char **argv) {
                 if (fabs(d) > max_abs) max_abs = fabs(d);
             }
             double rel = den > 0 ? sqrt(num / den) : sqrt(num);
-            if (v == 1 && !(rel <= 1e-6)) failures++;
+            if (differ) failures++;
             printf(" | %8zu %8.2e %8.2e", differ, max_abs, rel);
         }
-        if (bench) printf(" | %7.3f %7.3f %7.3f", ms[0], ms[1], ms[2]);
+        if (bench) printf(" | %7.3f %7.3f", ms[0], ms[1]);
         printf("\n");
-        h3_gpu_tensor *all[] = {padded, single, w3, w1, bias, w1_2d, bias_2d,
-                                outs[0], outs[1], outs[2]};
+        h3_gpu_tensor *all[] = {padded, single, w3, w1, bias, outs[0], outs[1]};
         for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) h3_gpu_tensor_free(all[i]);
         for (int v = 0; v < VARIANTS; v++) free(host[v]);
         free(x); free(w); free(w_last); free(b);
     }
     if (bench)
-        printf("sum of medians (one tile, each layer once): ref %.2f ms, kd1 %.2f ms, 2d %.2f ms\n",
-               total[0], total[1], total[2]);
-    printf("%s: kd1 rel L2 <= 1e-6 on %s\n", failures ? "FAIL" : "PASS",
+        printf("sum of medians (one tile, each layer once): ref %.2f ms, last tap %.2f ms\n",
+               total[0], total[1]);
+    printf("%s: last-tap conv byte-identical on %s\n", failures ? "FAIL" : "PASS",
            failures ? "not every layer" : "every layer");
     h3_gpu_free(gpu);
     return failures ? 1 : 0;

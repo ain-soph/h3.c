@@ -56,7 +56,7 @@ h3_bench_vae_block: tests/bench_vae_block.o $(LIB_OBJ)
 h3_bitexact_vae_ops: tests/bitexact_vae_ops.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-# H3_VAE_ENC_FAST: single-frame encoder convs against the causal Conv3d.
+# Video VAE encoder: the single-image last-tap conv is byte-identical to the causal Conv3d.
 h3_enc_fast_test: tests/test_enc_fast.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

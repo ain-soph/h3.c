@@ -2500,11 +2500,7 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
 
 /* mode 0: F32 (the reference); 1: BF16 compute (H3_VAE_ENC_BF16, opt-in:
  * F32 input cast to BF16 in the graph, BF16 weights, result cast back to F32
- * before the F32 bias); 2: T=1 as a 2D convolution (H3_VAE_ENC_FAST=2d, opt-in:
- * depth must equal kernel_depth after the causal pad, the weight is the last
- * temporal tap [O][I][kh][kw] on the single real frame, i.e. the caller
- * leaves out the causal zero frames and passes depth 1; numerically
- * equivalent, not bit-identical). */
+ * before the F32 bias). */
 static H3Conv *h3_gpu_conv3d_graph(
         H3GPU *gpu, uint32_t batch, uint32_t depth, uint32_t height,
         uint32_t width, uint32_t input_channels, uint32_t output_channels,
@@ -2530,39 +2526,6 @@ static H3Conv *h3_gpu_conv3d_graph(
         conv.biasShape = @[@1, @1, @1, @1, @(output_channels)];
         conv.outputShape = @[@(batch), @(output_depth), @(output_height),
                              @(output_width), @(output_channels)];
-        if (mode == 2) {
-            /* [B,1,H,W,C] spatially padded single frame as NHWC */
-            conv.inputShape = @[@(batch), @(height), @(width), @(input_channels)];
-            conv.weightShape = @[@(output_channels), @(input_channels),
-                                 @(kernel_height), @(kernel_width)];
-            conv.outputShape = @[@(batch), @(output_height), @(output_width),
-                                 @(output_channels)];
-            conv.biasShape = @[@1, @1, @1, @(output_channels)];
-            conv.input = [conv.graph placeholderWithShape:conv.inputShape
-                                                  dataType:MPSDataTypeFloat32 name:nil];
-            conv.weight = [conv.graph placeholderWithShape:conv.weightShape
-                                                   dataType:MPSDataTypeFloat32 name:nil];
-            MPSGraphConvolution2DOpDescriptor *descriptor2 =
-                [MPSGraphConvolution2DOpDescriptor
-                    descriptorWithStrideInX:stride_width strideInY:stride_height
-                    dilationRateInX:1 dilationRateInY:1 groups:1
-                    paddingLeft:0 paddingRight:0 paddingTop:0 paddingBottom:0
-                    paddingStyle:MPSGraphPaddingStyleExplicit
-                    dataLayout:MPSGraphTensorNamedDataLayoutNHWC
-                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-            MPSGraphTensor *result2 = [conv.graph
-                convolution2DWithSourceTensor:conv.input weightsTensor:conv.weight
-                descriptor:descriptor2 name:nil];
-            if (has_bias) {
-                conv.bias = [conv.graph placeholderWithShape:conv.biasShape
-                                                    dataType:MPSDataTypeFloat32 name:nil];
-                result2 = [conv.graph additionWithPrimaryTensor:result2
-                                                secondaryTensor:conv.bias name:nil];
-            }
-            conv.output = result2;
-            gpu.convCache[key] = conv;
-            return conv;
-        }
         conv.input = [conv.graph placeholderWithShape:conv.inputShape
                                               dataType:MPSDataTypeFloat32
                                                   name:nil];
@@ -2617,15 +2580,14 @@ static int h3_gpu_conv3d(h3_gpu *opaque, h3_gpu_tensor *output,
         !output_channels || !kernel_depth || !kernel_height || !kernel_width ||
         !stride_depth || !stride_height || !stride_width ||
         height < kernel_height || width < kernel_width ||
-        (mode == 2 && depth != 1) || (mode != 2 && depth < kernel_depth))
+        depth < kernel_depth || (mode != 0 && mode != 1))
         return 0;
-    uint32_t output_depth = mode == 2 ? 1 : (depth - kernel_depth) / stride_depth + 1;
+    uint32_t output_depth = (depth - kernel_depth) / stride_depth + 1;
     uint32_t output_height = (height - kernel_height) / stride_height + 1;
     uint32_t output_width = (width - kernel_width) / stride_width + 1;
     size_t input_count = (size_t)batch * depth * height * width * input_channels;
     size_t weight_count = (size_t)output_channels * input_channels *
-                          (mode == 2 ? 1 : kernel_depth) * kernel_height *
-                          kernel_width;
+                          kernel_depth * kernel_height * kernel_width;
     size_t output_count = (size_t)batch * output_depth * output_height *
                           output_width * output_channels;
     if (!h3_gpu_require_elements(gpu, input, input_count, @"Conv3d input") ||

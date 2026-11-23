@@ -29,7 +29,7 @@ static const uint32_t time_strides[LEVELS] = {1, 2, 2, 1, 1, 1};
 typedef struct {
     h3_gpu_tensor *weight;
     h3_gpu_tensor *bias;
-    h3_gpu_tensor *fast_weight;   /* opt-in variants: last temporal tap or BF16 */
+    h3_gpu_tensor *variant_weight; /* last temporal tap (T = 1) or BF16 copy */
     uint32_t input_channels;
     uint32_t output_channels;
     uint32_t kernel;
@@ -72,15 +72,20 @@ typedef struct {
     int busy;
 } pool_slot;
 
+/* How the causally padded 3x3x3 convs run. CONV_LAST_TAP (single image,
+ * T = 1): the conv over [0, 0, image] only gets products from its last
+ * temporal tap, so the image alone goes through a 1x3x3 Conv3d with that tap
+ * (same MPSGraph kernel family, byte-identical output, ~2.7x faster).
+ * CONV_BF16: opt-in H3_VAE_ENC_BF16=1, BF16 compute (not byte-identical). */
+enum { CONV_FULL = 0, CONV_LAST_TAP = 1, CONV_BF16 = 2 };
+
 typedef struct {
     h3_gpu *gpu;
     h3_weight_store *store;
     pool_slot pool[32];
     int pool_count;
-    int conv_mode;      /* variant of the causal 3x3x3 convs: 0 default, 1 BF16
-                         * (h3_gpu mode 1), 2 Conv2d (h3_gpu mode 2), 3 Conv3d
-                         * with a 1x3x3 kernel (h3_gpu mode 0); 2 and 3 run a
-                         * single frame on the last temporal tap */
+    int conv_mode;      /* the causal 3x3x3 convs: CONV_FULL, CONV_LAST_TAP or
+                         * CONV_BF16 */
     encoder_conv conv_in;
     encoder_level levels[LEVELS];
     encoder_norm norm_out;
@@ -120,7 +125,7 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 static void free_conv(encoder_conv *conv) {
     free_tensor(&conv->weight);
     free_tensor(&conv->bias);
-    free_tensor(&conv->fast_weight);
+    free_tensor(&conv->variant_weight);
 }
 
 static void free_norm(encoder_norm *norm) {
@@ -657,13 +662,13 @@ static void pool_put(encoder_context *encoder, h3_gpu_tensor *tensor) {
 
 static int enc_conv_mode(const encoder_context *encoder,
                          const encoder_conv *conv) {
-    return conv->fast_weight ? encoder->conv_mode : 0;
+    return conv->variant_weight ? encoder->conv_mode : CONV_FULL;
 }
 
-/* causal zero frames in front: none for the single-frame variants */
+/* causal zero frames in front: none for the single image */
 static uint32_t enc_front(const encoder_context *encoder,
                           const encoder_conv *conv) {
-    return enc_conv_mode(encoder, conv) >= 2 ? 0 : conv->depth_front;
+    return enc_conv_mode(encoder, conv) == CONV_LAST_TAP ? 0 : conv->depth_front;
 }
 
 static int enc_conv3d(encoder_context *encoder, h3_gpu_tensor *output,
@@ -671,15 +676,17 @@ static int enc_conv3d(encoder_context *encoder, h3_gpu_tensor *output,
                       uint32_t source_depth, uint32_t source_height,
                       uint32_t source_width, char *error, size_t error_size) {
     int mode = enc_conv_mode(encoder, conv);
-    /* mode 3 (H3_VAE_ENC_FAST=1): the image alone through a 1x3x3 Conv3d with
-     * the last temporal tap; the default kernel family, so it sums the same
-     * products as the 3x3x3 conv over [0, 0, image] minus the exact zeros */
+    /* CONV_LAST_TAP: kernel depth 1 on the single frame; the same Conv3d
+     * kernel family sums the same products as the 3x3x3 conv over
+     * [0, 0, image] minus the exact zeros */
     return gpu_op(encoder, h3_gpu_conv3d_f32_ex(
-        encoder->gpu, output, source, mode ? conv->fast_weight : conv->weight,
+        encoder->gpu, output, source,
+        mode != CONV_FULL ? conv->variant_weight : conv->weight,
         conv->bias, 1, source_depth, source_height, source_width,
         conv->input_channels, conv->output_channels,
-        mode == 3 ? 1 : conv->kernel, conv->kernel, conv->kernel,
-        conv->stride_t, conv->stride_h, conv->stride_w, mode == 3 ? 0 : mode),
+        mode == CONV_LAST_TAP ? 1 : conv->kernel, conv->kernel, conv->kernel,
+        conv->stride_t, conv->stride_h, conv->stride_w,
+        mode == CONV_BF16 ? 1 : 0),
         error, error_size, "visual encoder Conv3d");
 }
 
@@ -906,43 +913,42 @@ static float *unpack_moments(const encoder_context *encoder, const float *raw,
     return latent;
 }
 
-/* Opt-in variants' weights: the last temporal tap of every causally padded
- * 3x3x3 conv (H3_VAE_ENC_FAST, single image: modes 2 and 3) or BF16 copies
- * (H3_VAE_ENC_BF16, mode 1). */
-static int prepare_fast_weight(encoder_context *encoder, encoder_conv *conv) {
+/* Variant weights of every causally padded 3x3x3 conv: its last temporal tap
+ * (CONV_LAST_TAP) or a BF16 copy (CONV_BF16). */
+static int prepare_variant_weight(encoder_context *encoder, encoder_conv *conv) {
     if (conv->kernel != 3 || conv->depth_front != 2) return 1;
     size_t taps = (size_t)conv->output_channels * conv->input_channels;
     size_t count = taps * 27;
-    if (encoder->conv_mode == 1) {
-        conv->fast_weight = h3_gpu_tensor_new_bf16(encoder->gpu, count);
-        return conv->fast_weight && h3_gpu_cast_f32_to_bf16(
-            encoder->gpu, conv->fast_weight, conv->weight, (uint32_t)count);
+    if (encoder->conv_mode == CONV_BF16) {
+        conv->variant_weight = h3_gpu_tensor_new_bf16(encoder->gpu, count);
+        return conv->variant_weight && h3_gpu_cast_f32_to_bf16(
+            encoder->gpu, conv->variant_weight, conv->weight, (uint32_t)count);
     }
     float *full = malloc(count * sizeof(*full));
     float *last = malloc(taps * 9 * sizeof(*last));
     int ok = full && last && h3_gpu_tensor_read_f32(conv->weight, full, count);
     for (size_t tap = 0; ok && tap < taps; tap++)
         memcpy(last + tap * 9, full + tap * 27 + 18, 9 * sizeof(*last));
-    /* modes 2 and 3 never read the 3x3x3 weight again: drop it first, so the
-     * encoder's peak does not grow by the last-tap copies */
+    /* the 3x3x3 weight is never read again: drop it first, so the encoder's
+     * peak does not grow by the last-tap copies */
     if (ok) free_tensor(&conv->weight);
-    if (ok) conv->fast_weight = h3_gpu_tensor_from_f32(encoder->gpu, last, taps * 9);
+    if (ok) conv->variant_weight = h3_gpu_tensor_from_f32(encoder->gpu, last, taps * 9);
     free(full);
     free(last);
-    return ok && conv->fast_weight;
+    return ok && conv->variant_weight;
 }
 
-static int prepare_fast_weights(encoder_context *encoder) {
+static int prepare_variant_weights(encoder_context *encoder) {
     int began = h3_gpu_begin(encoder->gpu);
-    int ok = began && prepare_fast_weight(encoder, &encoder->conv_in);
+    int ok = began && prepare_variant_weight(encoder, &encoder->conv_in);
     for (int level = 0; ok && level < LEVELS; level++) {
         for (int block = 0; ok && block < BLOCKS; block++)
-            ok = prepare_fast_weight(encoder, &encoder->levels[level].blocks[block].conv1) &&
-                 prepare_fast_weight(encoder, &encoder->levels[level].blocks[block].conv2);
+            ok = prepare_variant_weight(encoder, &encoder->levels[level].blocks[block].conv1) &&
+                 prepare_variant_weight(encoder, &encoder->levels[level].blocks[block].conv2);
         if (ok && encoder->levels[level].has_downsample)
-            ok = prepare_fast_weight(encoder, &encoder->levels[level].downsample);
+            ok = prepare_variant_weight(encoder, &encoder->levels[level].downsample);
     }
-    ok = ok && prepare_fast_weight(encoder, &encoder->conv_out);
+    ok = ok && prepare_variant_weight(encoder, &encoder->conv_out);
     if (began && ok) return h3_gpu_submit(encoder->gpu);
     if (began) h3_gpu_abort(encoder->gpu);
     return 0;
@@ -1214,24 +1220,14 @@ int h3_video_vae_encode(const char *weight_directory,
     int latent_time = 0;
     const char *opt_env = getenv("H3_VAE_ENC_OPT");
     int opt = !(opt_env && !strcmp(opt_env, "0"));
-    const char *fast_env = getenv("H3_VAE_ENC_FAST");
     const char *bf16_env = getenv("H3_VAE_ENC_BF16");
-    /* Single image (T = 1): by default (or H3_VAE_ENC_FAST=1) a 1x3x3 Conv3d
-     * with the last temporal tap (mode 3; byte-identical to the 3x3x3 conv
-     * over [0, 0, image], FL2VA 768p 3.34 -> 1.25 s per image).
-     * H3_VAE_ENC_FAST=0 runs the 3x3x3 conv (rollback); =2d an MPSGraph
-     * Conv2d (mode 2, 0.60 s but latent rel L2 ~2.6e-6, opt-in only). */
-    int fast_off = fast_env && !strcmp(fast_env, "0");
-    int fast_on = fast_env && !strcmp(fast_env, "1");
-    int fast_2d = fast_env && !strcmp(fast_env, "2d");
-    int bf16 = bf16_env && !strcmp(bf16_env, "1");
-    if (opt && frames == 1 && fast_2d)
-        encoder.conv_mode = 2;
-    else if (opt && frames == 1 && !fast_off && (fast_on || !bf16))
-        encoder.conv_mode = 3;   /* the opt-in BF16 encoder keeps its images */
-    else if (opt && bf16)
-        encoder.conv_mode = 1;
-    if (ok && encoder.conv_mode && !prepare_fast_weights(&encoder)) {
+    /* B4 path only (H3_VAE_ENC_OPT=0 keeps the per-op path with the 3x3x3
+     * convs); the opt-in BF16 encoder keeps its single images */
+    if (opt && bf16_env && !strcmp(bf16_env, "1"))
+        encoder.conv_mode = CONV_BF16;
+    else if (opt && frames == 1)
+        encoder.conv_mode = CONV_LAST_TAP;
+    if (ok && encoder.conv_mode && !prepare_variant_weights(&encoder)) {
         fail(error, error_size, "cannot prepare visual encoder variant weights "
              "(out of memory or Metal error: %s)", h3_gpu_error(encoder.gpu));
         ok = 0;
