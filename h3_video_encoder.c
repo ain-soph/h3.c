@@ -77,7 +77,10 @@ typedef struct {
     h3_weight_store *store;
     pool_slot pool[32];
     int pool_count;
-    int conv_mode;      /* h3_gpu_conv3d_f32_ex mode of the 3x3x3 convs */
+    int conv_mode;      /* variant of the causal 3x3x3 convs: 0 default, 1 BF16
+                         * (h3_gpu mode 1), 2 Conv2d (h3_gpu mode 2), 3 Conv3d
+                         * with a 1x3x3 kernel (h3_gpu mode 0); 2 and 3 run a
+                         * single frame on the last temporal tap */
     encoder_conv conv_in;
     encoder_level levels[LEVELS];
     encoder_norm norm_out;
@@ -657,10 +660,10 @@ static int enc_conv_mode(const encoder_context *encoder,
     return conv->fast_weight ? encoder->conv_mode : 0;
 }
 
-/* causal zero frames in front: none for the single-frame 2D variant */
+/* causal zero frames in front: none for the single-frame variants */
 static uint32_t enc_front(const encoder_context *encoder,
                           const encoder_conv *conv) {
-    return enc_conv_mode(encoder, conv) == 2 ? 0 : conv->depth_front;
+    return enc_conv_mode(encoder, conv) >= 2 ? 0 : conv->depth_front;
 }
 
 static int enc_conv3d(encoder_context *encoder, h3_gpu_tensor *output,
@@ -668,12 +671,16 @@ static int enc_conv3d(encoder_context *encoder, h3_gpu_tensor *output,
                       uint32_t source_depth, uint32_t source_height,
                       uint32_t source_width, char *error, size_t error_size) {
     int mode = enc_conv_mode(encoder, conv);
+    /* mode 3 (H3_VAE_ENC_FAST=1): the image alone through a 1x3x3 Conv3d with
+     * the last temporal tap; the default kernel family, so it sums the same
+     * products as the 3x3x3 conv over [0, 0, image] minus the exact zeros */
     return gpu_op(encoder, h3_gpu_conv3d_f32_ex(
         encoder->gpu, output, source, mode ? conv->fast_weight : conv->weight,
         conv->bias, 1, source_depth, source_height, source_width,
-        conv->input_channels, conv->output_channels, conv->kernel,
-        conv->kernel, conv->kernel, conv->stride_t, conv->stride_h,
-        conv->stride_w, mode), error, error_size, "visual encoder Conv3d");
+        conv->input_channels, conv->output_channels,
+        mode == 3 ? 1 : conv->kernel, conv->kernel, conv->kernel,
+        conv->stride_t, conv->stride_h, conv->stride_w, mode == 3 ? 0 : mode),
+        error, error_size, "visual encoder Conv3d");
 }
 
 static int conv_padded(const encoder_conv *conv) {
@@ -900,7 +907,8 @@ static float *unpack_moments(const encoder_context *encoder, const float *raw,
 }
 
 /* Opt-in variants' weights: the last temporal tap of every causally padded
- * 3x3x3 conv (H3_VAE_ENC_FAST, single image) or BF16 copies (H3_VAE_ENC_BF16). */
+ * 3x3x3 conv (H3_VAE_ENC_FAST, single image: modes 2 and 3) or BF16 copies
+ * (H3_VAE_ENC_BF16, mode 1). */
 static int prepare_fast_weight(encoder_context *encoder, encoder_conv *conv) {
     if (conv->kernel != 3 || conv->depth_front != 2) return 1;
     size_t taps = (size_t)conv->output_channels * conv->input_channels;
@@ -1205,7 +1213,11 @@ int h3_video_vae_encode(const char *weight_directory,
     int opt = !(opt_env && !strcmp(opt_env, "0"));
     const char *fast_env = getenv("H3_VAE_ENC_FAST");
     const char *bf16_env = getenv("H3_VAE_ENC_BF16");
+    /* H3_VAE_ENC_FAST=1: 1x3x3 Conv3d (mode 3; numequiv gate: latent rel L2 <= 1e-6 vs the
+     * default); =2d: MPSGraph Conv2d (mode 2, ~2.6e-6, kept for comparison) */
     if (opt && fast_env && !strcmp(fast_env, "1") && frames == 1)
+        encoder.conv_mode = 3;
+    else if (opt && fast_env && !strcmp(fast_env, "2d") && frames == 1)
         encoder.conv_mode = 2;
     else if (opt && bf16_env && !strcmp(bf16_env, "1"))
         encoder.conv_mode = 1;
