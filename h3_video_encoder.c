@@ -1216,8 +1216,9 @@ int h3_video_vae_encode(const char *weight_directory,
     int opt = !(opt_env && !strcmp(opt_env, "0"));
     const char *fast_env = getenv("H3_VAE_ENC_FAST");
     const char *bf16_env = getenv("H3_VAE_ENC_BF16");
-    /* H3_VAE_ENC_FAST=1: 1x3x3 Conv3d (mode 3; numequiv gate: latent rel L2 <= 1e-6 vs the
-     * default); =2d: MPSGraph Conv2d (mode 2, ~2.6e-6, kept for comparison) */
+    /* H3_VAE_ENC_FAST=1: 1x3x3 Conv3d (mode 3; measured byte-identical to the
+     * default, FL2VA 768p 3.34 -> 1.25 s per image); =2d: MPSGraph Conv2d
+     * (mode 2, 0.60 s but latent rel L2 ~2.6e-6, kept for comparison) */
     if (opt && fast_env && !strcmp(fast_env, "1") && frames == 1)
         encoder.conv_mode = 3;
     else if (opt && fast_env && !strcmp(fast_env, "2d") && frames == 1)
