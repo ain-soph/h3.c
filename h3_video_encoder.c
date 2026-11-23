@@ -1216,14 +1216,20 @@ int h3_video_vae_encode(const char *weight_directory,
     int opt = !(opt_env && !strcmp(opt_env, "0"));
     const char *fast_env = getenv("H3_VAE_ENC_FAST");
     const char *bf16_env = getenv("H3_VAE_ENC_BF16");
-    /* H3_VAE_ENC_FAST=1: 1x3x3 Conv3d (mode 3; measured byte-identical to the
-     * default, FL2VA 768p 3.34 -> 1.25 s per image); =2d: MPSGraph Conv2d
-     * (mode 2, 0.60 s but latent rel L2 ~2.6e-6, kept for comparison) */
-    if (opt && fast_env && !strcmp(fast_env, "1") && frames == 1)
-        encoder.conv_mode = 3;
-    else if (opt && fast_env && !strcmp(fast_env, "2d") && frames == 1)
+    /* Single image (T = 1): by default (or H3_VAE_ENC_FAST=1) a 1x3x3 Conv3d
+     * with the last temporal tap (mode 3; byte-identical to the 3x3x3 conv
+     * over [0, 0, image], FL2VA 768p 3.34 -> 1.25 s per image).
+     * H3_VAE_ENC_FAST=0 runs the 3x3x3 conv (rollback); =2d an MPSGraph
+     * Conv2d (mode 2, 0.60 s but latent rel L2 ~2.6e-6, opt-in only). */
+    int fast_off = fast_env && !strcmp(fast_env, "0");
+    int fast_on = fast_env && !strcmp(fast_env, "1");
+    int fast_2d = fast_env && !strcmp(fast_env, "2d");
+    int bf16 = bf16_env && !strcmp(bf16_env, "1");
+    if (opt && frames == 1 && fast_2d)
         encoder.conv_mode = 2;
-    else if (opt && bf16_env && !strcmp(bf16_env, "1"))
+    else if (opt && frames == 1 && !fast_off && (fast_on || !bf16))
+        encoder.conv_mode = 3;   /* the opt-in BF16 encoder keeps its images */
+    else if (opt && bf16)
         encoder.conv_mode = 1;
     if (ok && encoder.conv_mode && !prepare_fast_weights(&encoder)) {
         fail(error, error_size, "cannot prepare visual encoder variant weights "
