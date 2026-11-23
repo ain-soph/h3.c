@@ -315,7 +315,8 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
  * the tensors. mode 0 = F32 (identical to h3_gpu_conv3d_f32), 1 = BF16 compute
  * with a BF16 weight (opt-in H3_VAE_ENC_BF16), 2 = a single frame (depth 1,
  * the causal zero frames left out) as a 2D convolution with the last temporal
- * tap [O][I][kh][kw] as weight (opt-in H3_VAE_ENC_FAST). */
+ * tap [O][I][kh][kw] as weight (opt-in H3_VAE_ENC_FAST=2d). H3_VAE_ENC_FAST=1
+ * uses mode 0 with kernel depth 1 and that tap instead. */
 int h3_gpu_conv3d_f32_ex(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight,

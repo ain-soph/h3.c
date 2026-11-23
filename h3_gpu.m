@@ -2500,7 +2500,7 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
 
 /* mode 0: F32 (the reference); 1: BF16 compute (H3_VAE_ENC_BF16, opt-in:
  * F32 input cast to BF16 in the graph, BF16 weights, result cast back to F32
- * before the F32 bias); 2: T=1 as a 2D convolution (H3_VAE_ENC_FAST, opt-in:
+ * before the F32 bias); 2: T=1 as a 2D convolution (H3_VAE_ENC_FAST=2d, opt-in:
  * depth must equal kernel_depth after the causal pad, the weight is the last
  * temporal tap [O][I][kh][kw] on the single real frame, i.e. the caller
  * leaves out the causal zero frames and passes depth 1; numerically

@@ -33,6 +33,11 @@ static double now(void) {
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
+static void *checked(void *pointer) {
+    if (!pointer) { fprintf(stderr, "out of memory\n"); exit(2); }
+    return pointer;
+}
+
 static int cmp_double(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y;
@@ -50,26 +55,27 @@ static h3_gpu_tensor *f32(size_t count) {
     return t;
 }
 
-typedef struct { uint32_t cin, cout, size, stride; const char *name; } shape;
+typedef struct { uint32_t cin, cout, size, stride, stride_t; const char *name; } shape;
 
 /* padded input extent `size` (spatial padding already applied, as in the
- * encoder: 1/1 for stride 1, 0/1 for the stride-2 downsamplers) */
+ * encoder: 1/1 for stride 1, 0/1 for the stride-2 downsamplers); stride_t as
+ * the encoder's time_strides (it is part of the MPSGraph descriptor) */
 static const shape shapes[] = {
-    {3, 128, 258, 1, "conv_in"},
-    {128, 128, 258, 1, "L0 conv"},
-    {128, 128, 257, 2, "L0 down"},
-    {128, 256, 130, 1, "L1 conv1"},
-    {256, 256, 130, 1, "L1 conv"},
-    {256, 256, 129, 2, "L1 down"},
-    {256, 256, 66, 1, "L2 conv"},
-    {256, 256, 65, 2, "L2 down"},
-    {256, 512, 34, 1, "L3 conv1"},
-    {512, 512, 34, 1, "L3 conv"},
-    {512, 512, 33, 2, "L3 down"},
-    {512, 512, 18, 1, "L4 conv"},
-    {512, 1024, 18, 1, "L5 conv1"},
-    {1024, 1024, 18, 1, "L5 conv"},
-    {1024, 48, 18, 1, "conv_out"},
+    {3, 128, 258, 1, 1, "conv_in"},
+    {128, 128, 258, 1, 1, "L0 conv"},
+    {128, 128, 257, 2, 1, "L0 down"},
+    {128, 256, 130, 1, 1, "L1 conv1"},
+    {256, 256, 130, 1, 1, "L1 conv"},
+    {256, 256, 129, 2, 2, "L1 down"},
+    {256, 256, 66, 1, 1, "L2 conv"},
+    {256, 256, 65, 2, 2, "L2 down"},
+    {256, 512, 34, 1, 1, "L3 conv1"},
+    {512, 512, 34, 1, 1, "L3 conv"},
+    {512, 512, 33, 2, 1, "L3 down"},
+    {512, 512, 18, 1, 1, "L4 conv"},
+    {512, 1024, 18, 1, 1, "L5 conv1"},
+    {1024, 1024, 18, 1, 1, "L5 conv"},
+    {1024, 48, 18, 1, 1, "conv_out"},
 };
 
 enum { VARIANTS = 3 };
@@ -77,19 +83,20 @@ static const char *variant_names[VARIANTS] = {"ref", "kd1", "2d"};
 
 static int run_variant(int variant, h3_gpu_tensor *out, h3_gpu_tensor *padded,
                        h3_gpu_tensor *single, h3_gpu_tensor *w3, h3_gpu_tensor *w1,
-                       h3_gpu_tensor *bias, const shape *s) {
-    uint32_t n = s->size, k = 3, st = s->stride;
+                       h3_gpu_tensor *bias, h3_gpu_tensor *w1_2d,
+                       h3_gpu_tensor *bias_2d, const shape *s) {
+    uint32_t n = s->size, k = 3, st = s->stride, tt = s->stride_t;
     if (!h3_gpu_begin(gpu)) return 0;
     int ok;
     if (variant == 0)
         ok = h3_gpu_conv3d_f32_ex(gpu, out, padded, w3, bias, 1, 3, n, n, s->cin,
-                                  s->cout, k, k, k, st, st, st, 0);
+                                  s->cout, k, k, k, tt, st, st, 0);
     else if (variant == 1)
         ok = h3_gpu_conv3d_f32_ex(gpu, out, single, w1, bias, 1, 1, n, n, s->cin,
-                                  s->cout, 1, k, k, st, st, st, 0);
-    else
-        ok = h3_gpu_conv3d_f32_ex(gpu, out, single, w1, bias, 1, 1, n, n, s->cin,
-                                  s->cout, k, k, k, st, st, st, 2);
+                                  s->cout, 1, k, k, tt, st, st, 0);
+    else   /* own weight / bias tensors: their cached graph data has a 4D shape */
+        ok = h3_gpu_conv3d_f32_ex(gpu, out, single, w1_2d, bias_2d, 1, 1, n, n,
+                                  s->cin, s->cout, k, k, k, tt, st, st, 2);
     if (!ok) { h3_gpu_abort(gpu); return 0; }
     return h3_gpu_submit(gpu);
 }
@@ -115,9 +122,10 @@ int main(int argc, char **argv) {
         uint32_t n = s->size, o = (n - 3) / s->stride + 1;
         size_t plane = (size_t)n * n * s->cin, out_count = (size_t)o * o * s->cout;
         size_t taps = (size_t)s->cout * s->cin;
-        float *x = calloc(plane * 3, sizeof(*x));   /* [0, 0, x] */
-        float *w = malloc(taps * 27 * sizeof(*w)), *w_last = malloc(taps * 9 * sizeof(*w));
-        float *b = malloc(s->cout * sizeof(*b));
+        float *x = checked(calloc(plane * 3, sizeof(*x)));   /* [0, 0, x] */
+        float *w = checked(malloc(taps * 27 * sizeof(*w)));
+        float *w_last = checked(malloc(taps * 9 * sizeof(*w)));
+        float *b = checked(malloc(s->cout * sizeof(*b)));
         for (size_t i = 0; i < plane; i++) x[2 * plane + i] = 3.0f * uniform();
         float scale = 1.0f / sqrtf((float)(s->cin * 27));
         /* the zero-frame taps get real weights too: they must not matter */
@@ -127,13 +135,14 @@ int main(int argc, char **argv) {
         h3_gpu_tensor *padded = upload(x, plane * 3), *single = upload(x + 2 * plane, plane);
         h3_gpu_tensor *w3 = upload(w, taps * 27), *w1 = upload(w_last, taps * 9);
         h3_gpu_tensor *bias = upload(b, s->cout);
+        h3_gpu_tensor *w1_2d = upload(w_last, taps * 9), *bias_2d = upload(b, s->cout);
         h3_gpu_tensor *outs[VARIANTS];
         float *host[VARIANTS];
         double ms[VARIANTS] = {0};
         for (int v = 0; v < VARIANTS; v++) {
             outs[v] = f32(out_count);
-            host[v] = malloc(out_count * sizeof(float));
-            if (!run_variant(v, outs[v], padded, single, w3, w1, bias, s) ||
+            host[v] = checked(malloc(out_count * sizeof(float)));
+            if (!run_variant(v, outs[v], padded, single, w3, w1, bias, w1_2d, bias_2d, s) ||
                 !h3_gpu_tensor_read_f32(outs[v], host[v], out_count)) {
                 fprintf(stderr, "%s %s: %s\n", s->name, variant_names[v], h3_gpu_error(gpu));
                 return 2;
@@ -145,7 +154,12 @@ int main(int argc, char **argv) {
                 double t[REPS];
                 for (int r = 0; r < WARM + REPS; r++) {
                     double t0 = now();
-                    run_variant(v, outs[v], padded, single, w3, w1, bias, s);
+                    if (!run_variant(v, outs[v], padded, single, w3, w1, bias,
+                                     w1_2d, bias_2d, s)) {
+                        fprintf(stderr, "%s %s: %s\n", s->name, variant_names[v],
+                                h3_gpu_error(gpu));
+                        return 2;
+                    }
                     if (r >= WARM) t[r - WARM] = (now() - t0) * 1e3;
                 }
                 qsort(t, REPS, sizeof(*t), cmp_double);
@@ -173,7 +187,8 @@ int main(int argc, char **argv) {
         }
         if (bench) printf(" | %7.3f %7.3f %7.3f", ms[0], ms[1], ms[2]);
         printf("\n");
-        h3_gpu_tensor *all[] = {padded, single, w3, w1, bias, outs[0], outs[1], outs[2]};
+        h3_gpu_tensor *all[] = {padded, single, w3, w1, bias, w1_2d, bias_2d,
+                                outs[0], outs[1], outs[2]};
         for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) h3_gpu_tensor_free(all[i]);
         for (int v = 0; v < VARIANTS; v++) free(host[v]);
         free(x); free(w); free(w_last); free(b);

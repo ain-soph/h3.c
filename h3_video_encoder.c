@@ -923,6 +923,9 @@ static int prepare_fast_weight(encoder_context *encoder, encoder_conv *conv) {
     int ok = full && last && h3_gpu_tensor_read_f32(conv->weight, full, count);
     for (size_t tap = 0; ok && tap < taps; tap++)
         memcpy(last + tap * 9, full + tap * 27 + 18, 9 * sizeof(*last));
+    /* modes 2 and 3 never read the 3x3x3 weight again: drop it first, so the
+     * encoder's peak does not grow by the last-tap copies */
+    if (ok) free_tensor(&conv->weight);
     if (ok) conv->fast_weight = h3_gpu_tensor_from_f32(encoder->gpu, last, taps * 9);
     free(full);
     free(last);
